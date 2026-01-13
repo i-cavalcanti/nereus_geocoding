@@ -13,7 +13,7 @@ dt <- as.data.table(readRDS("D:\\Arq-Azzoni\\UrbanSprawl\\Bases_dados\\RAIS_esta
 dt[, municipio_7 := ibge6_to_7(municipio)]
 dt <- add_sigla_from_uf(dt, "cduf", "uf_dom")
 dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
-dt[, numero:= NA]
+dt[, numlograd:= NA]
 
 
 
