@@ -1,6 +1,6 @@
 source("scripts/general-functions.R")
 source("scripts/data-standardization.R")
-source("scripts/geocoding_first_stage.R")
+source("geocoding_first_stage.R")
 
 required_packages <- c("enderecobr","geocodebr", "data.table", "sf")
 

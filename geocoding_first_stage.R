@@ -260,7 +260,6 @@ main_geocodificacao <- function(
   campos,
   var_col = "estoque",
   sd_threshold_km = 0.5
-
 ) {
   
   #### Parâmetros estruturais ####
@@ -268,44 +267,52 @@ main_geocodificacao <- function(
   aceito_col <- "aceito"
   
   #### 1. Geocodificação e classificação ####
+  message("[1/5] Limpando e Geocodificando endereços - frame de ", nrow(dt), " linhas...")
   dt3 <- geocodificar_enderecos(
     dt                 = dt,
     campos_do_endereco = campos,
     classe_col         = classe_col
   )
+  message("[1/5] Concluído!")
   
   #### 2. Subconjunto CEP ####
   dt_cep <- dt3[get(classe_col) == 1L]
+  message("[2/5] Extraindo subset de CEPs ", nrow(dt_cep), " registros de CEP selecionados.")
   
   #### 3. Filtro de CEPs consistentes ####
+  message("[3/5] Filtrando CEPs consistentes...")
   res <- filtrar_ceps_consistentes(
     dt_ceps         = dt_cep,
     sd_threshold_km = sd_threshold_km
   )
-  
   ceps_aceitos <- res$ceps_aceitos
-  # diagnostico <- res$diagnostico  # opcional
+  message("[3/5] Concluído! ", length(ceps_aceitos), " CEPs aceitos",
+          " de um total de ", length(unique(dt_cep$cep_padr)), " CEPs avaliados.")
   
   #### 4. Filtro final de endereços ####
+  message("[4/5] Aplicando filtro final nos endereços...")
   dt3 <- filtrar_enderecos_aceitos(
     dt           = dt3,
     ceps_aceitos = ceps_aceitos,
     classe_col   = classe_col,
     aceito_col   = aceito_col
   )
+  message("[4/5] Concluído! Endereços filtrados.")
   
   #### 5. Estatísticas descritivas ####
+  message("[5/5] Calculando estatísticas descritivas...")
   stats <- descritivas(
     dt          = dt3,
     estoque_col = var_col,
     aceito_col  = aceito_col
   )
+  message("[5/5] Concluído! Estatísticas calculadas.")
   
   #### 6. Retorno ####
+  message("Processo finalizado com sucesso!")
+  
   list(
     dt_f = dt3,
-    stats    = stats
+    stats = stats
   )
 }
-
-

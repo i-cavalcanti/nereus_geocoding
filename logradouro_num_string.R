@@ -34,32 +34,32 @@ default_stopwords <- c(
   "garage", "terreo", "tereo", "térreo", "térreo", "andar térreo", "andar terreo", "parte","slj", "quiosque", "piso"
 )
 
-#--------------------------------------------------------------
-# FUNÇÃO AUXILIAR – extrair número aplicando TODAS as regras
-#--------------------------------------------------------------
-extract_num_from_address <- function(txt, stop_pos) {
-  if (is.na(txt) || txt == "") return(NA_real_)
+# #--------------------------------------------------------------
+# # FUNÇÃO AUXILIAR – extrair número aplicando TODAS as regras
+# #--------------------------------------------------------------
+# extract_num_from_address <- function(txt, stop_pos) {
+#   if (is.na(txt) || txt == "") return(NA_real_)
   
-  # 1) Se existe stopword → usar só o trecho antes dela
-  considered <- if (!is.na(stop_pos)) substr(txt, 1, stop_pos - 1) else txt
-  considered <- str_squish(considered)
-  if (considered == "") return(NA_real_)
+#   # 1) Se existe stopword → usar só o trecho antes dela
+#   considered <- if (!is.na(stop_pos)) substr(txt, 1, stop_pos - 1) else txt
+#   considered <- str_squish(considered)
+#   if (considered == "") return(NA_real_)
   
-  # 2) Se houver sequência de números consecutivos → pegar o primeiro
-  seq_match <- str_match(
-    considered,
-    "\\b(\\d{1,5})(?:\\s+\\d{1,5})+\\b"
-  )
-  if (!all(is.na(seq_match))) {
-    return(as.numeric(seq_match[, 2]))
-  }
+#   # 2) Se houver sequência de números consecutivos → pegar o primeiro
+#   seq_match <- str_match(
+#     considered,
+#     "\\b(\\d{1,5})(?:\\s+\\d{1,5})+\\b"
+#   )
+#   if (!all(is.na(seq_match))) {
+#     return(as.numeric(seq_match[, 2]))
+#   }
   
-  # 3) Caso contrário → pegar o último número do trecho
-  nums <- str_extract_all(considered, "\\d{1,5}")[[1]]
-  if (length(nums) == 0) return(NA_real_)
+#   # 3) Caso contrário → pegar o último número do trecho
+#   nums <- str_extract_all(considered, "\\d{1,5}")[[1]]
+#   if (length(nums) == 0) return(NA_real_)
   
-  as.numeric(tail(nums, 1))
-}
+#   as.numeric(tail(nums, 1))
+# }
 
 #--------------------------------------------------------------
 # FUNÇÃO PRINCIPAL – VERSÃO FINAL
