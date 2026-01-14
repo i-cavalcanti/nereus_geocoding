@@ -1,6 +1,6 @@
 source("scripts/general-functions.R")
 source("scripts/data-standardization.R")
-source("filtro_numero_fast.R")
+source("logradouro_num_string.R")
 
 required_packages <- c("enderecobr","geocodebr", "data.table", "sf")
 
@@ -8,99 +8,111 @@ check_and_install_packages(required_packages)
 lapply(required_packages, library, character.only = TRUE)
 
 
-dt <- as.data.table(readRDS("D:\\Arq-Azzoni\\UrbanSprawl\\Bases_dados\\RAIS_estab\\Niteroi\\rais_niteroi_2009_2023.rds"))
-dt <- data.table(fread("D:\\Arq-Azzoni\\RAIS\\rais-geocoding\\data\\raw\\rais_temp\\sp_estb_2023_limpo.csv"))
-
-t <- head(dt, 1000)
-
-dt[, municipio_7 := ibge6_to_7(municipio)]
-dt <- add_sigla_from_uf(dt, "cduf", "uf_dom")
-dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
-dt[, numlograd:= NA]
-
-
-
-campos <- correspondencia_campos(
-  logradouro = "endereco",
-  numero = "numlograd",
-  cep = "cep",
-  bairro = "bairro",
-  municipio = "municipio_7",
-  estado = "uf_dom"
-)
-
-dt <- padronizar_enderecos(dt, campos_do_endereco = campos)
-dt[ numero_padr == "S/N", numero_padr := NA]
-
-
-
-dt2 <- logradouro_num_string_fast(
+geocodificar_enderecos <- function(
   dt,
-  endereco_col = "logradouro_padr",
-  num_col = "numero_padr",
-  complemento_col = "complemento",
-  endereco_update_mode = "cut_when_missing_num"
-)
-
-
-
-campos <- geocodebr::definir_campos(
-  logradouro = "endereco_limpo",
-  numero = "numlograd_novo",
-  cep = "cep_padr",
-  localidade = "bairro_padr",
-  municipio = "municipio_padr",
-  estado = "estado_padr"
+  campos_do_endereco,
+  classe_col = "classe"
+) {
+  
+  stopifnot(
+    data.table::is.data.table(dt),
+    is.character(classe_col),
+    length(classe_col) == 1L
   )
-
-# Segundo passo: geolocalizar
-dt3 <- geocodebr::geocode(
-  enderecos = dt2,
-  campos_endereco = campos,
-  resultado_completo = FALSE,
-  resolver_empates = TRUE,
-  resultado_sf = TRUE,
-  verboso = FALSE
+  
+  #### 1. Padronização de endereços ####
+  dt <- padronizar_enderecos(
+    dt,
+    campos_do_endereco = campos_do_endereco
   )
+  
+  #### 2. Limpeza do número ####
+  dt[numero_padr == "S/N", numero_padr := NA]
+  
+  #### 3. Separação logradouro / número ####
+  dt2 <- logradouro_num_string_fast(
+    dt,
+    endereco_col = "logradouro_padr",
+    num_col = "numero_padr",
+    complemento_col = "complemento",
+    endereco_update_mode = "cut_when_missing_num"
+  )
+  
+  #### 4. Definição dos campos de geocodificação ####
+  campos <- geocodebr::definir_campos(
+    logradouro  = "endereco_limpo",
+    numero      = "numlograd_novo",
+    cep         = "cep_padr",
+    localidade  = "bairro_padr",
+    municipio   = "municipio_padr",
+    estado      = "estado_padr"
+  )
+  
+  #### 5. Geocodificação ####
+  dt3 <- geocodebr::geocode(
+    enderecos            = dt2,
+    campos_endereco      = campos,
+    resultado_completo   = FALSE,
+    resolver_empates     = TRUE,
+    resultado_sf         = TRUE,
+    verboso              = FALSE
+  )
+  
+  data.table::setDT(dt3)
+  
+  #### 6. Classificação da precisão ####
+  dt3[, (classe_col) := data.table::fifelse(
+    precisao %in% c("numero", "numero_aproximado", "logradouro"), 0L,
+    data.table::fifelse(precisao == "cep", 1L, 2L)
+  )]
+  
+  return(dt3)
+}
 
-setDT(dt3)
 
-dt3[, classe :=
-      fifelse(precisao %in% c("numero", "numero_aproximado", "logradouro"), 0,
-      fifelse(precisao == "cep", 1, 2))]
-
-t <- head(dt3, 1000)
-View(t)
-
-
-dt_cep <- dt3[classe == 1]
-
-#Filtro ceps
-
-# CEPs únicos
-ceps <- unique(dt_cep$cep_padr)
-ceps <- dt_cep[!is.na(cep_padr), unique(cep_padr)]
-
-
-#### 2. Geocodificar CEPs únicos ####
-df_ceps <- geocodebr::busca_por_cep(
-  cep          = ceps,
-  resultado_sf = TRUE,
-  verboso      = FALSE
-)
-
-#### 3. Distância máxima entre pontos por CEP ####
-df_ceps_sf <- st_transform(df_ceps, 31983) # SIRGAS / UTM 23S (RJ)
-coords <- st_coordinates(df_ceps_sf)
-
-df_ceps <- as.data.table(df_ceps)
-df_ceps[, `:=`(
-  x = coords[, 1],
-  y = coords[, 2]
-)]
-
-sd_by_cep <- df_ceps[
-  , {
+filtrar_ceps_consistentes <- function(
+  dt_ceps,
+  sd_threshold_km
+) {
+  
+  cep_col <- "cep_padr"
+  
+  stopifnot(
+    data.table::is.data.table(dt_ceps),
+    cep_col %in% names(dt_ceps),
+    is.numeric(sd_threshold_km),
+    length(sd_threshold_km) == 1L
+  )
+  
+  #### 1. CEPs únicos válidos ####
+  ceps <- dt_ceps[!is.na(get(cep_col)), unique(get(cep_col))]
+  
+  if (length(ceps) == 0L) {
+    return(list(
+      ceps_aceitos = character(0),
+      diagnostico  = data.table::data.table()
+    ))
+  }
+  
+  #### 2. Geocodificar CEPs ####
+  df_ceps <- geocodebr::busca_por_cep(
+    cep          = ceps,
+    resultado_sf = TRUE,
+    verboso      = FALSE
+  )
+  
+  #### 3. Cálculo das distâncias ####
+  df_ceps_sf <- sf::st_transform(df_ceps, 31983) # SIRGAS / UTM 23S
+  coords     <- sf::st_coordinates(df_ceps_sf)
+  
+  df_ceps <- data.table::as.data.table(df_ceps)
+  df_ceps[, `:=`(
+    x = coords[, 1],
+    y = coords[, 2]
+  )]
+  
+  sd_by_cep <- df_ceps[
+    , {
       if (.N < 2L) {
         list(mean_dist_m = NA_real_, sd_dist_m = NA_real_)
       } else {
@@ -113,188 +125,187 @@ sd_by_cep <- df_ceps[
         )
       }
     },
-  by = cep
-]
-
-sd_by_cep[, `:=`(
-  mean_dist_km = mean_dist_m / 1000,
-  sd_dist_km   = sd_dist_m / 1000
-)]
-
-#### 4. Resumo por CEP ####
-df_ceps_dt <- as.data.table(df_ceps)
-
-summary_ceps <- df_ceps_dt[, .(
-  n_points = .N,
-  single   = .N == 1L
-), by = cep]
-
-final_tbl <- merge(
-  sd_by_cep,
-  summary_ceps,
-  by = "cep",
-  all.x = TRUE
-)
-setorder(final_tbl, cep)
-
-# limiar ajustável (ex.: 500 metros)
-sd_threshold_km <- 0.5
-
-#Se os pontos de um CEP costumam ficar, em média, 
-#a menos de ~500 m de variação em relação ao centróide,
-#o CEP é considerado consistente.
-
-final_tbl[, aceito := fifelse(
-  single == TRUE | sd_dist_km <= sd_threshold_km,
-  1L, 0L
-)]
-
-ceps_aceitos <- final_tbl[aceito == 1, cep]
-
-rm(df_ceps_dt, sd_by_cep, summary_ceps, final_tbl, df_ceps, coords)
-#gc()
-
-#Filtro endereços aceitos
-
-ceps_ok <- unique(data.table(cep_padr = ceps_aceitos))
-setkey(ceps_ok, cep_padr)
-
-dt3[, cep_ok := 0L]
-
-dt3[
-  ceps_ok,
-  cep_ok := 1L,
-  on = "cep_padr",
-  nomatch = 0L
-]
-
-dt3[, aceito := fcase(
-  classe == 0L, 1L,
-  classe == 1L & cep_ok == 1L, 1L,
-  default = 0L
-)]
-
-dt3[, cep_ok := NULL]
-
-t <- head(dt3, 1000)
-
-
-### Descritivas por n rows
-
-tab <- dt3[, .N, by = .(classe, aceito)]
-
-print(tab)
-
-tab_stats <- dt3[
-  , .N, by = .(classe, aceito)
-][
-  , `:=`(
-    prop  = N / sum(N),
-    perc  = 100 * N / sum(N)
-  ),
-  by = classe
-]
-
-print(tab_stats)
-
-descritivas <- dt3[, .N, by = aceito][
-  , `:=`(
-    proporcao  = N / sum(N),
-    percentual = 100 * N / sum(N)
+    by = cep
+  ]
+  
+  sd_by_cep[, `:=`(
+    mean_dist_km = mean_dist_m / 1000,
+    sd_dist_km   = sd_dist_m / 1000
+  )]
+  
+  #### 4. Resumo por CEP ####
+  summary_ceps <- df_ceps[
+    , .(
+      n_points = .N,
+      single   = .N == 1L
+    ),
+    by = cep
+  ]
+  
+  diagnostico <- merge(
+    sd_by_cep,
+    summary_ceps,
+    by = "cep",
+    all.x = TRUE
   )
-]
-
-print(descritivas)
-
-
-### Descritivas por estoque
-
-
-stats_estoque <- dt3[
-  , .(estoque_total = sum(estoque, na.rm = TRUE)),
-  by = .(classe, aceito)
-][
-  , `:=`(
-      prop = estoque_total / sum(estoque_total),
-      perc = 100 * estoque_total / sum(estoque_total)
-    ),
-  by = classe
-]
-
-print(stats_estoque)
+  
+  #### 5. Aplicar critério ####
+  diagnostico[, aceito := data.table::fifelse(
+    single == TRUE | sd_dist_km <= sd_threshold_km,
+    1L, 0L
+  )]
+  
+  data.table::setorder(diagnostico, cep)
+  
+  #### 6. Retorno ####
+  list(
+    ceps_aceitos = diagnostico[aceito == 1L, cep],
+    diagnostico  = diagnostico
+  )
+}
 
 
-### Descritivas gerais 
-stats_aceito <- dt3[
-  , .(
+filtrar_enderecos_aceitos <- function(
+  dt,
+  ceps_aceitos,
+  classe_col,
+  aceito_col = "aceito"
+) {
+  
+  cep_col <- "cep_padr"
+  
+  stopifnot(
+    data.table::is.data.table(dt),
+    is.character(ceps_aceitos),
+    cep_col %in% names(dt),
+    is.character(classe_col),
+    length(classe_col) == 1L,
+    classe_col %in% names(dt),
+    is.character(aceito_col),
+    length(aceito_col) == 1L
+  )
+  
+  #### 1. Tabela de CEPs aceitos ####
+  ceps_ok <- unique(
+    data.table::data.table(
+      cep_padr = ceps_aceitos
+    )
+  )
+  data.table::setkey(ceps_ok, cep_padr)
+  
+  #### 2. Flag CEP válido ####
+  dt[, cep_ok := 0L]
+  
+  dt[
+    ceps_ok,
+    cep_ok := 1L,
+    on = "cep_padr",
+    nomatch = 0L
+  ]
+  
+  #### 3. Regra de aceitação ####
+  dt[, (aceito_col) := data.table::fcase(
+    get(classe_col) == 0L, 1L,
+    get(classe_col) == 1L & cep_ok == 1L, 1L,
+    default = 0L
+  )]
+  
+  #### 4. Limpeza ####
+  dt[, cep_ok := NULL]
+  
+  return(dt)
+}
+
+descritivas <- function(
+  dt,
+  estoque_col,
+  aceito_col = "aceito"
+) {
+  
+  stopifnot(
+    data.table::is.data.table(dt),
+    is.character(estoque_col),
+    length(estoque_col) == 1L,
+    estoque_col %in% names(dt),
+    is.character(aceito_col),
+    length(aceito_col) == 1L,
+    aceito_col %in% names(dt)
+  )
+  
+  stats_aceito <- dt[
+    , .(
       n_linhas      = .N,
-      estoque_total = sum(estoque, na.rm = TRUE)
+      estoque_total = sum(get(estoque_col), na.rm = TRUE)
     ),
-  by = aceito
-][
-  , `:=`(
+    by = get(aceito_col)
+  ]
+  
+  data.table::setnames(stats_aceito, "get", aceito_col)
+  
+  stats_aceito[
+    , `:=`(
       prop_linhas  = n_linhas / sum(n_linhas),
       perc_linhas  = 100 * n_linhas / sum(n_linhas),
       prop_estoque = estoque_total / sum(estoque_total),
       perc_estoque = 100 * estoque_total / sum(estoque_total)
     )
-]
-
-print(stats_aceito)
-
-
-####### Testar precisao CEPS únicos ########
+  ]
+  
+  return(stats_aceito)
+}
 
 
+main_geocodificacao <- function(
+  dt,
+  campos,
+  var_col = "estoque",
+  sd_threshold_km = 0.5
 
-dt_single_cep <- df_ceps[
-  , if (.N == 1L) .SD,
-  by = cep
-]
-class(dt_single_cep$geometry)
-
-
-dt_ref_sf   <- st_as_sf(dt_single_cep)
-dt_outro_sf <- st_as_sf(dt_cep)
-
-# garantir CRS igual
-st_crs(dt_outro_sf) <- st_crs(dt_ref_sf)
-
-setDT(dt_outro_sf)
-setDT(dt_ref_sf)
-
-class(dt_outro_sf)
-
-dt_outro_filt <- dt_outro_sf[
-  dt_ref_sf,
-  on = c("cep_padr" = "cep")
-]
-
-dt_outro_filt_sf <- st_as_sf(dt_outro_filt)
-
-dt_outro_filt_sf$dist_m <-
-  as.numeric(
-    st_distance(
-      dt_outro_filt_sf$geometry,
-      dt_outro_filt_sf$i.geometry,
-      by_element = TRUE
-    )
+) {
+  
+  #### Parâmetros estruturais ####
+  classe_col <- "classe"
+  aceito_col <- "aceito"
+  
+  #### 1. Geocodificação e classificação ####
+  dt3 <- geocodificar_enderecos(
+    dt                 = dt,
+    campos_do_endereco = campos,
+    classe_col         = classe_col
   )
-summary(dt_outro_filt_sf$dist_m, na.rm = TRUE)
+  
+  #### 2. Subconjunto CEP ####
+  dt_cep <- dt3[get(classe_col) == 1L]
+  
+  #### 3. Filtro de CEPs consistentes ####
+  res <- filtrar_ceps_consistentes(
+    dt_ceps         = dt_cep,
+    sd_threshold_km = sd_threshold_km
+  )
+  
+  ceps_aceitos <- res$ceps_aceitos
+  # diagnostico <- res$diagnostico  # opcional
+  
+  #### 4. Filtro final de endereços ####
+  dt3 <- filtrar_enderecos_aceitos(
+    dt           = dt3,
+    ceps_aceitos = ceps_aceitos,
+    classe_col   = classe_col,
+    aceito_col   = aceito_col
+  )
+  
+  #### 5. Estatísticas descritivas ####
+  stats <- descritivas(
+    dt          = dt3,
+    estoque_col = var_col,
+    aceito_col  = aceito_col
+  )
+  
+  #### 6. Retorno ####
+  list(
+    dt_f = dt3,
+    stats    = stats
+  )
+}
 
-d <- dt_outro_filt_sf[order(-dt_outro_filt_sf$dist_m), ]
 
-st_crs(dt_outro_filt_sf)
-st_is_longlat(dt_outro_filt_sf)
-sf::sf_use_s2()
-
-# Para Niteroi a distancia máxima foi de ~400m
-
-
-
-dt_filtrado <- dt3[aceito == 0]
-t <- head(dt_filtrado, 1000)
-View(t)
-
-unique(dt3[aceito == 0, precisao])
-dt3[precisao == "numero_aproximado" & classe != 0, .N, by = precisao]

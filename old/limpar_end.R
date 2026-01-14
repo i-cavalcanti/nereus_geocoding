@@ -15,6 +15,13 @@ dt <- add_sigla_from_uf(dt, "cduf", "uf_dom")
 dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
 dt[, numlograd:= NA]
 
+######
+
+dt <- as.data.table(readRDS("D:\\Bases\\PETLOVER\\Clinicas_RAIS.rds"))
+dt[, municipio_7 := ibge6_to_7(municipio)]
+dt <- add_sigla_from_uf(dt, "uf", "uf_dom")
+dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
+
 
 
 campos <- correspondencia_campos(
@@ -23,7 +30,7 @@ campos <- correspondencia_campos(
   cep = "cep",
   bairro = "bairro",
   municipio = "municipio_7",
-  estado = "uf_dom"
+  estado = "uf"
 )
 
 dt <- padronizar_enderecos(dt, campos_do_endereco = campos)

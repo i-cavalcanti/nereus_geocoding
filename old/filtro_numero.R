@@ -135,7 +135,7 @@ logradouro_num_string <- function(
   num_out <- num_orig
   num_out[needs_update & !is.na(num_extracted)] <- num_extracted[needs_update & !is.na(num_extracted)]
   num_out <- as.numeric(num_out)
-  
+  # An update would be: rerun geocoding with number extraction from address field 
 #----------------------------------------
 # 6) Remover o número usado do endereço (onde foi atualizado)
 #    -> se houver sequência "6501 257", remove a SEQUÊNCIA inteira

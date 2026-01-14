@@ -67,3 +67,9 @@ change_cep_99999999_to_na <- function(dt, cep_column, municipio_column) {
   return(dt)
 }
 
+add_col_if_missing <- function(dt, col, value = NA) {
+  if (!col %in% names(dt)) {
+    dt[, (col) := value]
+  }
+  dt
+}
