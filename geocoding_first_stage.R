@@ -259,7 +259,7 @@ main_geocodificacao <- function(
   dt,
   campos,
   var_col = "estoque",
-  sd_threshold_km = 0.5
+  sd_threshold_km = 0.3
 ) {
   
   #### Parâmetros estruturais ####
