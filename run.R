@@ -14,7 +14,7 @@ lapply(required_packages, library, character.only = TRUE)
 out <- main_first_stage_geocoding(
   pathname_in  = "D:/Arq-Azzoni/RAIS/rais-geocoding/data",
   pathname_out = "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding",
-  years = 2017:2002,
+  years = 2010:2002,
   filename_prefix = "sp",
   sd_threshold_km = 0.3,
   filter_municipio_7 = NULL,

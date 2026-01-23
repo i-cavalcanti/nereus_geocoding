@@ -66,25 +66,21 @@ main_first_stage_geocoding <- function(
     dt <- data.table::fread(file_in, encoding = encoding, select = select_cols)
     log("Linhas lidas: ", nrow(dt))
 
-    # Ajuste esta lista conforme seu schema real
-    needed <- c("municipio", "cduf", "cep", "bairro", "endereco", "estoque")
-    missing_cols <- setdiff(needed, names(dt))
-    if (length(missing_cols) > 0) {
-      stop("Ano ", year, ": faltam colunas no CSV: ", paste(missing_cols, collapse = ", "))
+    needed_min <- c("municipio", "cduf", "cep", "endereco", "estoque")
+    missing_min <- setdiff(needed_min, names(dt))
+    if (length(missing_min) > 0) {
+      stop("Ano ", year, ": faltam colunas no CSV: ", paste(missing_min, collapse = ", "))
     }
 
+    # opcionais: criar se faltar
+    if (!("bairro" %in% names(dt)))    dt[, bairro := NA_character_]
     if (!("numlograd" %in% names(dt))) dt[, numlograd := NA]
 
-    # Pré-processamentos (mantidos)
+    # ---- Pré-processamentos ----
     dt[, municipio_7 := ibge6_to_7(municipio)]
     dt <- add_sigla_from_uf(dt, "cduf", "uf_dom")
     dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
     dt <- add_col_if_missing(dt, "numlograd", NA)
-
-    if (!is.null(filter_municipio_7)) {
-      dt <- dt[municipio_7 %chin% as.character(filter_municipio_7)]
-      log("Filtro municipio_7 aplicado. Linhas após filtro: ", nrow(dt))
-    }
 
     campos <- correspondencia_campos(
       logradouro = "endereco",
