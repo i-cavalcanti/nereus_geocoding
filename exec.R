@@ -7,8 +7,9 @@ main_first_stage_geocoding <- function(
   verbose = TRUE,
   filename_prefix = "sp",
   filter_municipio_7 = NULL,
-  select_cols = NULL,
+  select_cols = NULL,                 # <-- só para fread (input raw)
   stats_filename = "stats_geocoding.csv",
+  operation = "cut_when_missing_num",
   overwrite = FALSE
 ) {
   stopifnot(
@@ -19,17 +20,11 @@ main_first_stage_geocoding <- function(
     is.character(filename_prefix), length(filename_prefix) == 1L
   )
 
-  if (!requireNamespace("data.table", quietly = TRUE)) {
-    stop("Pacote 'data.table' não instalado.")
-  }
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("Pacote 'data.table' não instalado.")
 
-  log <- function(...) {
-    if (isTRUE(verbose)) {
-      message(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), paste0(...))
-    }
-  }
+  log <- function(...) if (isTRUE(verbose)) message(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), paste0(...))
 
-  # Pasta de saída para RDS
+  # saída
   out_dir <- file.path(pathname_out, "geocoded_rds")
   if (overwrite && dir.exists(out_dir)) {
     log("Removendo saída anterior (overwrite=TRUE): ", out_dir)
@@ -37,17 +32,19 @@ main_first_stage_geocoding <- function(
   }
   dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 
-  # Stats em CSV (append)
   stats_file <- file.path(out_dir, stats_filename)
-  if (overwrite && file.exists(stats_file)) {
-    unlink(stats_file, force = TRUE)
-  }
+  if (overwrite && file.exists(stats_file)) unlink(stats_file, force = TRUE)
 
   years <- as.integer(years)
 
-  # Em vez de guardar dt gigante, guardamos o caminho do arquivo salvo
-  rds_paths <- setNames(vector("list", length(years)), as.character(years))
+  rds_paths  <- setNames(vector("list", length(years)), as.character(years))
   stats_list <- setNames(vector("list", length(years)), as.character(years))
+
+  # colunas mínimas que PRECISAM vir do CSV bruto
+  needed_min_raw <- c("municipio", "cduf", "cep", "endereco", "estoque")
+
+  # colunas usadas no geocoding (existem após pré-processamento)
+  geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id")
 
   for (year in years) {
     t0 <- Sys.time()
@@ -63,24 +60,48 @@ main_first_stage_geocoding <- function(
       next
     }
 
-    dt <- data.table::fread(file_in, encoding = encoding, select = select_cols)
+    # --- select_cols: somente para fread; garantir que colunas mínimas sempre entram
+    read_cols <- select_cols
+    if (!is.null(read_cols)) {
+      # IMPORTANTÍSSIMO: não inclua aqui colunas criadas depois (municipio_7, uf_dom etc.)
+      read_cols <- unique(c(read_cols, needed_min_raw))
+      log("fread(select=...) com ", length(read_cols), " colunas (inclui mínimas).")
+    } else {
+      log("fread sem select (lendo todas as colunas).")
+    }
+
+    dt <- data.table::fread(file_in, encoding = encoding, select = read_cols)
     log("Linhas lidas: ", nrow(dt))
 
-    needed_min <- c("municipio", "cduf", "cep", "endereco", "estoque")
-    missing_min <- setdiff(needed_min, names(dt))
+    # validar colunas mínimas do RAW
+    missing_min <- setdiff(needed_min_raw, names(dt))
     if (length(missing_min) > 0) {
       stop("Ano ", year, ": faltam colunas no CSV: ", paste(missing_min, collapse = ", "))
     }
 
-    # opcionais: criar se faltar
+    # opcionais: criar se faltar (RAW)
     if (!("bairro" %in% names(dt)))    dt[, bairro := NA_character_]
     if (!("numlograd" %in% names(dt))) dt[, numlograd := NA]
+
 
     # ---- Pré-processamentos ----
     dt[, municipio_7 := ibge6_to_7(municipio)]
     dt <- add_sigla_from_uf(dt, "cduf", "uf_dom")
     dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
-    dt <- add_col_if_missing(dt, "numlograd", NA)
+
+    # Filtro opcional por município
+    if (!is.null(filter_municipio_7)) {
+      n0 <- nrow(dt)
+      dt <- dt[municipio_7 %in% unlist(filter_municipio_7)]
+      log("Filtro municipio_7 aplicado: ", n0, " -> ", nrow(dt), " linhas")
+    }
+
+    # reduzir dt
+    miss_geo <- setdiff(geocode_keep, names(dt))
+    if (length(miss_geo) > 0) {
+      stop("Ano ", year, ": faltam colunas pós-processamento para geocoding: ", paste(miss_geo, collapse = ", "))
+    }
+    dt <- dt[, ..geocode_keep]
 
     campos <- correspondencia_campos(
       logradouro = "endereco",
@@ -97,7 +118,8 @@ main_first_stage_geocoding <- function(
           dt              = dt,
           campos          = campos,
           var_col         = "estoque",
-          sd_threshold_km = sd_threshold_km
+          sd_threshold_km = sd_threshold_km,
+          operation       = operation
         )
       },
       error = function(e) {
@@ -108,20 +130,18 @@ main_first_stage_geocoding <- function(
     )
 
     if (is.null(res)) {
-      rm(dt)
-      gc()
+      rm(dt); gc()
       next
     }
 
     dt_f  <- res$dt_f
     stats <- res$stats
 
-    # Salvar RDS por ano (mantém geometry/sfc/sf intacto)
+    # salvar RDS por ano
     rds_file <- file.path(out_dir, paste0("dt_f_", year, ".rds"))
     saveRDS(dt_f, rds_file)
     rds_paths[[as.character(year)]] <- rds_file
 
-    # Guardar stats também em memória (pequeno) + append em CSV
     stats_list[[as.character(year)]] <- stats
 
     stats_row <- tryCatch(
@@ -131,19 +151,16 @@ main_first_stage_geocoding <- function(
         sdt[, year := year]
         sdt
       },
-      error = function(e) {
-        data.table::data.table(year = year, status = "stats_parse_failed")
-      }
+      error = function(e) data.table::data.table(year = year, status = "stats_parse_failed")
     )
 
     data.table::fwrite(
       stats_row,
       stats_file,
-      append = file.exists(stats_file),
+      append    = file.exists(stats_file),
       col.names = !file.exists(stats_file)
     )
 
-    # Limpeza de RAM
     rm(dt, dt_f, res, stats, stats_row)
     gc()
 
@@ -155,8 +172,8 @@ main_first_stage_geocoding <- function(
   }
 
   invisible(list(
-    rds_paths  = rds_paths,   # lista de caminhos (append-friendly, sem RAM)
-    stats_list = stats_list,  # stats pequenos
+    rds_paths  = rds_paths,
+    stats_list = stats_list,
     out_dir    = out_dir,
     stats_file = stats_file
   ))
@@ -180,36 +197,7 @@ montar_rds_paths_da_pasta <- function(
   out
 }
 
-listar_municipios_nos_rds <- function(
-  rds_paths,
-  municipio_col = "municipio_7",
-  verbose = TRUE
-) {
-  log <- function(...) if (isTRUE(verbose)) message(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), paste0(...))
 
-  mun_all <- character(0)
-
-  for (y in names(rds_paths)) {
-    p <- rds_paths[[y]]
-    if (is.null(p) || !nzchar(p) || !file.exists(p)) next
-
-    log("Lendo ano ", y, " para listar municipios: ", p)
-    dt <- readRDS(p)
-
-    if (!(municipio_col %in% names(dt))) {
-      stop("Coluna '", municipio_col, "' não existe no RDS: ", p)
-    }
-
-    mun_all <- unique(c(mun_all, as.character(unique(dt[[municipio_col]]))))
-
-    rm(dt); gc()
-  }
-
-  mun_all <- mun_all[!is.na(mun_all) & nzchar(mun_all)]
-  sort(unique(mun_all))
-}
-
-library(data.table)
 
 main_second_stage_geocoding <- function(
   pathname_out_prev,
@@ -222,6 +210,7 @@ main_second_stage_geocoding <- function(
   # padrão do nome do CSV final por ano
   filename_prefix = "sp",
   out_suffix = "_limpo_corr.csv",
+  geo_threshold_m = 1000,
   overwrite_csv = FALSE,
   verbose = TRUE
 ) {
@@ -283,7 +272,7 @@ main_second_stage_geocoding <- function(
 
   # roda tudo de uma vez
   log("Rodando main_multiyear()...")
-  res <- main_multiyear(dt_all, diff_threshold = diff_threshold)
+  res <- main_multiyear(dt_all, diff_threshold = diff_threshold, geo_threshold_m = geo_threshold_m)
 
   dt_final <- as.data.table(res$dt_final)
 

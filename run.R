@@ -14,10 +14,12 @@ lapply(required_packages, library, character.only = TRUE)
 out <- main_first_stage_geocoding(
   pathname_in  = "D:/Arq-Azzoni/RAIS/rais-geocoding/data",
   pathname_out = "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding",
-  years = 2010:2002,
+  years = 2023:2002,
   filename_prefix = "sp",
   sd_threshold_km = 0.3,
+  operation = "always_cut_on_stopword",
   filter_municipio_7 = NULL,
+  #filter_municipio_7 = c("3525904","3543402","3529005","3534708"),
   verbose = TRUE
 )
 
@@ -25,7 +27,8 @@ out <- main_first_stage_geocoding(
 main_second_stage_geocoding(
   pathname_out_prev = "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding",
   out_dir_csv       = "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/csv_por_ano",
-  diff_threshold = 0.3,
+  diff_threshold = 0.2,
+  geo_threshold_m = 1000,
   filename_prefix = "sp",
   out_suffix = "_limpo_corr.csv",
   overwrite_csv = TRUE,

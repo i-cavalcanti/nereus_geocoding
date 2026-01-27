@@ -11,7 +11,8 @@ lapply(required_packages, library, character.only = TRUE)
 geocodificar_enderecos <- function(
   dt,
   campos_do_endereco,
-  classe_col = "classe"
+  classe_col = "classe",
+  operation = "cut_when_missing_num"
 ) {
   
   stopifnot(
@@ -35,7 +36,7 @@ geocodificar_enderecos <- function(
     endereco_col = "logradouro_padr",
     num_col = "numero_padr",
     complemento_col = "complemento",
-    endereco_update_mode = "cut_when_missing_num"
+    endereco_update_mode = operation
   )
   
   #### 4. Definição dos campos de geocodificação ####
@@ -199,8 +200,7 @@ filtrar_enderecos_aceitos <- function(
   dt[
     ceps_ok,
     cep_ok := 1L,
-    on = "cep_padr",
-    nomatch = 0L
+    on = "cep_padr"
   ]
   
   #### 3. Regra de aceitação ####
@@ -259,7 +259,8 @@ main_geocodificacao <- function(
   dt,
   campos,
   var_col = "estoque",
-  sd_threshold_km = 0.3
+  sd_threshold_km = 0.3,
+  operation = "cut_when_missing_num"
 ) {
   
   #### Parâmetros estruturais ####
@@ -271,7 +272,8 @@ main_geocodificacao <- function(
   dt3 <- geocodificar_enderecos(
     dt                 = dt,
     campos_do_endereco = campos,
-    classe_col         = classe_col
+    classe_col         = classe_col,
+    operation = operation
   )
   message("[1/5] Concluído!")
   
