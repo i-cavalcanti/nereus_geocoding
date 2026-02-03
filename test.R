@@ -13,7 +13,7 @@ lapply(required_packages, library, character.only = TRUE)
 
 # ---- parâmetros de teste ----
 pathname_in  <- "D:/Arq-Azzoni/RAIS/rais-geocoding/data"   # ajuste
-year         <- 2002
+year         <- 2007
 encoding     <- "Latin-1"
 filename_prefix <- "sp"
 

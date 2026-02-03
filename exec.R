@@ -7,6 +7,7 @@ main_first_stage_geocoding <- function(
   verbose = TRUE,
   filename_prefix = "sp",
   filter_municipio_7 = NULL,
+  filter_cnae = NULL,
   select_cols = NULL,                 # <-- só para fread (input raw)
   stats_filename = "stats_geocoding.csv",
   operation = "cut_when_missing_num",
@@ -44,7 +45,7 @@ main_first_stage_geocoding <- function(
   needed_min_raw <- c("municipio", "cduf", "cep", "endereco", "estoque")
 
   # colunas usadas no geocoding (existem após pré-processamento)
-  geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id")
+  geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id", "sbclas20")
 
   for (year in years) {
     t0 <- Sys.time()
@@ -94,6 +95,13 @@ main_first_stage_geocoding <- function(
       n0 <- nrow(dt)
       dt <- dt[municipio_7 %in% unlist(filter_municipio_7)]
       log("Filtro municipio_7 aplicado: ", n0, " -> ", nrow(dt), " linhas")
+    }
+
+    # Filtro opcional por cnae
+    if (!is.null(filter_cnae)) {
+      n0 <- nrow(dt)
+      dt <- dt[sbclas20 %in% unlist(filter_cnae)]
+      log("Filtro cnae aplicado: ", n0, " -> ", nrow(dt), " linhas")
     }
 
     # reduzir dt

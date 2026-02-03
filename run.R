@@ -20,6 +20,7 @@ out <- main_first_stage_geocoding(
   operation = "always_cut_on_stopword",
   filter_municipio_7 = NULL,
   #filter_municipio_7 = c("3525904","3543402","3529005","3534708"),
+  filter_cnae = c(7500100, 4789004, 9609208, 4771704),
   verbose = TRUE
 )
 
