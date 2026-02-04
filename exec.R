@@ -10,7 +10,6 @@ main_first_stage_geocoding <- function(
   filter_cnae = NULL,
   select_cols = NULL,                 # <-- só para fread (input raw)
   stats_filename = "stats_geocoding.csv",
-  operation = "cut_when_missing_num",
   overwrite = FALSE
 ) {
   stopifnot(
@@ -45,7 +44,7 @@ main_first_stage_geocoding <- function(
   needed_min_raw <- c("municipio", "cduf", "cep", "endereco", "estoque")
 
   # colunas usadas no geocoding (existem após pré-processamento)
-  geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id", "sbclas20")
+  geocode_keep <- c("id","endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial")
 
   for (year in years) {
     t0 <- Sys.time()
@@ -100,7 +99,7 @@ main_first_stage_geocoding <- function(
     # Filtro opcional por cnae
     if (!is.null(filter_cnae)) {
       n0 <- nrow(dt)
-      dt <- dt[sbclas20 %in% unlist(filter_cnae)]
+      dt <- dt[clascnae20 %in% unlist(filter_cnae)]
       log("Filtro cnae aplicado: ", n0, " -> ", nrow(dt), " linhas")
     }
 
@@ -110,14 +109,23 @@ main_first_stage_geocoding <- function(
       stop("Ano ", year, ": faltam colunas pós-processamento para geocoding: ", paste(miss_geo, collapse = ", "))
     }
     dt <- dt[, ..geocode_keep]
-
-    campos <- correspondencia_campos(
+  
+    campos <- geocodebr::definir_campos(
       logradouro = "endereco",
       numero     = "numlograd",
       cep        = "cep",
-      bairro     = "bairro",
+      localidade     = "bairro",
       municipio  = "municipio_7",
       estado     = "uf_dom"
+    )
+
+    campos_pdr <- correspondencia_campos(
+      logradouro = "endereco",
+      numero = "numlograd",
+      cep = "cep",
+      bairro = "bairro",
+      municipio = "municipio_7",
+      estado = "uf_dom"
     )
 
     res <- tryCatch(
@@ -125,9 +133,9 @@ main_first_stage_geocoding <- function(
         main_geocodificacao(
           dt              = dt,
           campos          = campos,
+          campos_pdr      = campos_pdr,
           var_col         = "estoque",
-          sd_threshold_km = sd_threshold_km,
-          operation       = operation
+          sd_threshold_km = sd_threshold_km
         )
       },
       error = function(e) {

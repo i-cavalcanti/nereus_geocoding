@@ -1,74 +1,75 @@
-source("scripts/general-functions.R")
-source("scripts/data-standardization.R")
-source("logradouro_num_string.R")
+# source("scripts/general-functions.R")
+# source("scripts/data-standardization.R")
+# source("logradouro_num_string.R")
+# source("geocodificar_enderecos.R")
 
-required_packages <- c("enderecobr","geocodebr", "data.table", "sf")
+# required_packages <- c("enderecobr","geocodebr", "data.table", "sf")
 
-check_and_install_packages(required_packages)
-lapply(required_packages, library, character.only = TRUE)
+# check_and_install_packages(required_packages)
+# lapply(required_packages, library, character.only = TRUE)
 
 
-geocodificar_enderecos <- function(
-  dt,
-  campos_do_endereco,
-  classe_col = "classe",
-  operation = "cut_when_missing_num"
-) {
-  
-  stopifnot(
-    data.table::is.data.table(dt),
-    is.character(classe_col),
-    length(classe_col) == 1L
-  )
-  
-  #### 1. Padronização de endereços ####
-  dt <- padronizar_enderecos(
-    dt,
-    campos_do_endereco = campos_do_endereco
-  )
-  
-  #### 2. Limpeza do número ####
-  dt[numero_padr == "S/N", numero_padr := NA]
-  
-  #### 3. Separação logradouro / número ####
-  dt2 <- logradouro_num_string_fast(
-    dt,
-    endereco_col = "logradouro_padr",
-    num_col = "numero_padr",
-    complemento_col = "complemento",
-    endereco_update_mode = operation
-  )
-  
-  #### 4. Definição dos campos de geocodificação ####
-  campos <- geocodebr::definir_campos(
-    logradouro  = "endereco_limpo",
-    numero      = "numlograd_novo",
-    cep         = "cep_padr",
-    localidade  = "bairro_padr",
-    municipio   = "municipio_padr",
-    estado      = "estado_padr"
-  )
-  
-  #### 5. Geocodificação ####
-  dt3 <- geocodebr::geocode(
-    enderecos            = dt2,
-    campos_endereco      = campos,
-    resultado_completo   = FALSE,
-    resolver_empates     = TRUE,
-    resultado_sf         = TRUE,
-    verboso              = FALSE
-  )
-  
-  data.table::setDT(dt3)
-  
-  #### 6. Classificação da precisão ####
-  dt3[, (classe_col) := data.table::fifelse(
-    precisao %in% c("numero", "numero_aproximado", "logradouro"), 0L,
-    data.table::fifelse(precisao == "cep", 1L, 2L)
-  )]
-  
-  return(dt3)
-}
+  # geocodificar_enderecos <- function(
+  #   dt,
+  #   campos_do_endereco,
+  #   classe_col = "classe",
+  #   operation = "cut_when_missing_num"
+  # ) {
+    
+  #   stopifnot(
+  #     data.table::is.data.table(dt),
+  #     is.character(classe_col),
+  #     length(classe_col) == 1L
+  #   )
+    
+  #   #### 1. Padronização de endereços ####
+  #   dt <- padronizar_enderecos(
+  #     dt,
+  #     campos_do_endereco = campos_do_endereco
+  #   )
+    
+  #   #### 2. Limpeza do número ####
+  #   dt[numero_padr == "S/N", numero_padr := NA]
+    
+  #   #### 3. Separação logradouro / número ####
+  #   dt2 <- logradouro_num_string_fast(
+  #     dt,
+  #     endereco_col = "logradouro_padr",
+  #     num_col = "numero_padr",
+  #     complemento_col = "complemento",
+  #     endereco_update_mode = operation
+  #   )
+    
+  #   #### 4. Definição dos campos de geocodificação ####
+  #   campos <- geocodebr::definir_campos(
+  #     logradouro  = "endereco_limpo",
+  #     numero      = "numlograd_novo",
+  #     cep         = "cep_padr",
+  #     localidade  = "bairro_padr",
+  #     municipio   = "municipio_padr",
+  #     estado      = "estado_padr"
+  #   )
+    
+  #   #### 5. Geocodificação ####
+  #   dt3 <- geocodebr::geocode(
+  #     enderecos            = dt2,
+  #     campos_endereco      = campos,
+  #     resultado_completo   = FALSE,
+  #     resolver_empates     = TRUE,
+  #     resultado_sf         = TRUE,
+  #     verboso              = FALSE
+  #   )
+    
+  #   data.table::setDT(dt3)
+    
+  #   #### 6. Classificação da precisão ####
+  #   dt3[, (classe_col) := data.table::fifelse(
+  #     precisao %in% c("numero", "numero_aproximado", "logradouro"), 0L,
+  #     data.table::fifelse(precisao == "cep", 1L, 2L)
+  #   )]
+    
+  #   return(dt3)
+  # }
 
 
 filtrar_ceps_consistentes <- function(
@@ -258,9 +259,9 @@ descritivas <- function(
 main_geocodificacao <- function(
   dt,
   campos,
+  campos_pdr,
   var_col = "estoque",
-  sd_threshold_km = 0.3,
-  operation = "cut_when_missing_num"
+  sd_threshold_km = 0.3
 ) {
   
   #### Parâmetros estruturais ####
@@ -269,12 +270,8 @@ main_geocodificacao <- function(
   
   #### 1. Geocodificação e classificação ####
   message("[1/5] Limpando e Geocodificando endereços - frame de ", nrow(dt), " linhas...")
-  dt3 <- geocodificar_enderecos(
-    dt                 = dt,
-    campos_do_endereco = campos,
-    classe_col         = classe_col,
-    operation = operation
-  )
+  dt3 <- geocode_pipeline(dt, campos, campos_pdr)
+  dt3 <- classificar_precisao_best(dt3, precisao_best_col = "precisao_best", classe_col = classe_col)
   message("[1/5] Concluído!")
   
   #### 2. Subconjunto CEP ####

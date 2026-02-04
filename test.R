@@ -1,8 +1,12 @@
 source("scripts/general-functions.R")
 source("scripts/data-standardization.R")
+source("scripts/metrics-functions.R")
 source("logradouro_num_string.R")
 source("geocoding_first_stage.R")
 source("geocoding_second_stage.R")
+source("geocodificar_enderecos.R")
+
+
 
 
 required_packages <- c("enderecobr","geocodebr", "data.table", "sf")
@@ -13,7 +17,7 @@ lapply(required_packages, library, character.only = TRUE)
 
 # ---- parâmetros de teste ----
 pathname_in  <- "D:/Arq-Azzoni/RAIS/rais-geocoding/data"   # ajuste
-year         <- 2007
+year         <- 2015
 encoding     <- "Latin-1"
 filename_prefix <- "sp"
 
@@ -36,14 +40,253 @@ dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
 if (!("bairro" %in% names(dt)))    dt[, bairro := NA_character_]
 if (!("numlograd" %in% names(dt))) dt[, numlograd := NA]
 
-campos <- correspondencia_campos(
+geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id")
+# filter_cnae = c(7500100, 4789004, 9609208, 4771704)
+# dt <- dt[sbclas20 %in% unlist(filter_cnae)]
+filter_municipio_7 = c("3525904","3543402","3529005","3534708")
+dt <- dt[municipio_7 %in% filter_municipio_7]
+dt <- dt[, ..geocode_keep]
+
+campos <- geocodebr::definir_campos(
       logradouro = "endereco",
       numero     = "numlograd",
       cep        = "cep",
-      bairro     = "bairro",
+      localidade     = "bairro",
       municipio  = "municipio_7",
       estado     = "uf_dom"
     )
+
+campos_pdr <- correspondencia_campos(
+  logradouro = "endereco",
+  numero = "numlograd",
+  cep = "cep",
+  bairro = "bairro",
+  municipio = "municipio_7",
+  estado = "uf_dom"
+)
+
+dt_out <- geocode_pipeline_bestgeom(dt, campos, campos_pdr)
+
+
+
+dt_out <- classificar_precisao_best(dt_out, precisao_best_col = "precisao_best", classe_col = "classe")
+
+#############################################
+
+
+
+g_raw <- geocode_step(dt, campos, "raw", keep_geometry = FALSE)
+
+dt_pad <- padronizar_enderecos(dt, campos_do_endereco = campos_pdr)
+
+if ("numero_padr" %in% names(dt_pad)) dt_pad[numero_padr == "S/N", numero_padr := NA]
+
+campos_pad <- geocodebr::definir_campos(
+    logradouro = "logradouro_padr",
+    numero     = "numero_padr",
+    cep        = "cep_padr",
+    localidade = "bairro_padr",
+    municipio  = "municipio_padr",
+    estado     = "estado_padr"
+  )
+
+g_pad <- geocode_step(dt_pad, campos_pad, "pad", keep_geometry = FALSE)
+
+dt_lns <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      endereco_update_mode = "no_cut"
+    )
+
+campos_lns <- geocodebr::definir_campos(
+      logradouro = "endereco_limpo",
+      numero     = "numlograd_novo",
+      cep        = "cep_padr",
+      localidade = "bairro_padr",
+      municipio  = "municipio_padr",
+      estado     = "estado_padr"
+    )
+
+g_lns_0 <- geocode_step(dt_lns, campos_lns, "lns_0", keep_geometry = FALSE)
+
+dt_lns <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      endereco_update_mode =  "cut_when_missing_num"
+    )
+
+g_lns_1 <- geocode_step(dt_lns, campos_lns, "lns_1", keep_geometry = FALSE)
+
+dt_lns <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      endereco_update_mode =  "always_cut_on_stopword"
+    )
+
+g_lns_2 <- geocode_step(dt_lns, campos_lns, "lns_2", keep_geometry = FALSE)
+
+for (nm in c("g_raw","g_pad","g_lns_0","g_lns_1","g_lns_2")) {
+  setkey(get(nm), id)
+}
+
+dt_out <- Reduce(function(x, y) y[x], list(g_raw, g_pad, g_lns_0, g_lns_1, g_lns_2))
+
+
+score_cols <- grep("^score_precisao", names(dt_out), value = TRUE)
+
+# melhor (menor) e pior (maior) por linha
+dt_out[, best_score  := do.call(pmin, c(.SD, na.rm = TRUE)), .SDcols = score_cols]
+dt_out[, worst_score := do.call(pmax, c(.SD, na.rm = TRUE)), .SDcols = score_cols]
+
+# se todas forem NA, pmin/pmax viram +/-Inf -> volta pra NA
+dt_out[is.infinite(best_score),  best_score  := NA_real_]
+dt_out[is.infinite(worst_score), worst_score := NA_real_]
+
+# diferença
+dt_out[, diff := worst_score - best_score]
+
+
+stopifnot(length(score_cols) > 0)
+
+m <- as.matrix(dt_out[, ..score_cols])
+
+# NA vira +Inf pra não ganhar como mínimo
+m2 <- m
+m2[is.na(m2)] <- Inf
+
+# linhas onde tudo era NA
+all_na <- rowSums(is.na(m)) == ncol(m)
+
+# índice do menor por linha (empate -> última)
+idx <- max.col(-m2, ties.method = "last")
+
+dt_out[, best_score_col := score_cols[idx]]
+dt_out[all_na, best_score_col := NA_character_]
+
+# opcional: salvar só o "step"
+dt_out[, best_step := sub("^score_precisao_", "", best_score_col)]
+
+
+###############
+geocode_step <- function(dt_in, campos, step_tag,
+                         id_key = "id",
+                         keep_geometry = FALSE,
+                         resultado_completo = FALSE,
+                         resolver_empates = TRUE,
+                         verboso = FALSE,
+                         precisao_col = "tipo_resultado") {
+
+  stopifnot(data.table::is.data.table(dt_in))
+  if (!(id_key %in% names(dt_in))) stop("geocode_step: falta '", id_key, "' no input.")
+
+  # ---- garantir que 'id' é uma chave válida
+  stopifnot("id" %in% names(dt))
+  stopifnot(!anyNA(dt$id))
+
+  if (data.table::uniqueN(dt$id) != nrow(dt)) {
+    stop("id não é único (uniqueN(id) != nrow(dt)). Não pode usar id como chave.")
+  }
+
+  dt_local <- dt_in
+
+  # remove colunas começando com "." (evita quebra no SQL)
+  dot_cols <- grep("^\\.", names(dt_local), value = TRUE)
+  if (length(dot_cols) > 0L) dt_local[, (dot_cols) := NULL]
+
+  g <- geocodebr::geocode(
+    enderecos          = dt_local,
+    campos_endereco    = campos,
+    resultado_completo = resultado_completo,
+    resolver_empates   = resolver_empates,
+    resultado_sf       = isTRUE(keep_geometry),
+    verboso            = verboso
+  )
+  g <- data.table::as.data.table(g)
+
+  if (!(id_key %in% names(g))) stop("geocode_step: '", id_key, "' não veio no retorno do geocode.")
+  if (!(precisao_col %in% names(g))) stop("geocode_step: '", precisao_col, "' não veio no retorno do geocode.")
+
+  score_col <- paste0("score_precisao_", step_tag)
+  g <- criar_score_precisao(g, precisao_col = precisao_col, score_col = score_col)
+
+  prec_out <- paste0("precisao_", step_tag)
+  data.table::setnames(g, precisao_col, prec_out)
+
+  out_cols <- c(id_key, prec_out, score_col)
+
+  if (isTRUE(keep_geometry)) {
+    if (!("geometry" %in% names(g))) stop("geocode_step: geometry não veio (resultado_sf=TRUE?).")
+    geom_out <- paste0("geometry_", step_tag)
+    data.table::setnames(g, "geometry", geom_out)
+    out_cols <- c(out_cols, geom_out)
+  }
+
+  g[, ..out_cols]
+}
+
+
+
+##############
+
+dt3 <- geocodificar_enderecos_v4(
+    dt                 = dt,
+    campos_do_endereco = campos
+  )
+
+##############
+
+score_cols <- grep("^score_", names(dt3), value = TRUE)
+
+dt3[, score_min := do.call(pmin.int, c(.SD, na.rm = TRUE)), .SDcols = score_cols]
+dt3[, score_dif := score_precisao - score_min]
+
+
+dt_pad <- padronizar_enderecos(dt, campos_do_endereco = campos)
+
+dt_nc  <- logradouro_num_string_fast(dt_pad, "logradouro_padr","numero_padr","complemento", "no_cut")
+dt_cmn <- logradouro_num_string_fast(dt_pad, "logradouro_padr","numero_padr","complemento", "cut_when_missing_num")
+dt_acs <- logradouro_num_string_fast(dt_pad, "logradouro_padr","numero_padr","complemento", "always_cut_on_stopword")
+
+# how many rows actually change?
+c(
+  diff_nc_cmn = sum(dt_nc$endereco_limpo != dt_cmn$endereco_limpo, na.rm=TRUE),
+  diff_cmn_acs = sum(dt_cmn$endereco_limpo != dt_acs$endereco_limpo, na.rm=TRUE),
+  diff_nc_acs = sum(dt_nc$endereco_limpo != dt_acs$endereco_limpo, na.rm=TRUE)
+)
+
+c(
+  diff_num_nc_cmn  = sum(dt_nc$numlograd_novo != dt_cmn$numlograd_novo, na.rm=TRUE),
+  diff_num_cmn_acs = sum(dt_cmn$numlograd_novo != dt_acs$numlograd_novo, na.rm=TRUE),
+  diff_num_nc_acs  = sum(dt_nc$numlograd_novo != dt_acs$numlograd_novo, na.rm=TRUE)
+)
+
+dt_sub <- dt[1:5000]
+dt_sub[, row_id := .I]
+
+# RAW
+g_raw <- geocodebr::geocode(dt_sub,
+  geocodebr::definir_campos(campos[["logradouro"]],campos[["numero"]],campos[["cep"]],
+                            campos[["bairro"]],campos[["municipio"]],campos[["estado"]]),
+  resultado_sf = FALSE, verboso = FALSE
+)
+
+# PAD
+dt_pad <- padronizar_enderecos(dt_sub, campos_do_endereco = campos)
+g_pad <- geocodebr::geocode(dt_pad,
+  geocodebr::definir_campos("logradouro_padr","numero_padr","cep_padr","bairro_padr","municipio_padr","estado_padr"),
+  resultado_sf = FALSE, verboso = FALSE
+)
+
+table(g_raw$precisao, useNA="ifany")
+table(g_pad$precisao, useNA="ifany")
+
+###############
 
 dt <- padronizar_enderecos(
     dt,
