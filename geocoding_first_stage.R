@@ -74,10 +74,10 @@
 
 filtrar_ceps_consistentes <- function(
   dt_ceps,
-  sd_threshold_km
+  sd_threshold_km,
+  cep_col = "cep_padr"
 ) {
   
-  cep_col <- "cep_padr"
   
   stopifnot(
     data.table::is.data.table(dt_ceps),
@@ -171,10 +171,10 @@ filtrar_enderecos_aceitos <- function(
   dt,
   ceps_aceitos,
   classe_col,
+  cep_col = "cep_padr",
   aceito_col = "aceito"
 ) {
   
-  cep_col <- "cep_padr"
   
   stopifnot(
     data.table::is.data.table(dt),
@@ -256,6 +256,8 @@ descritivas <- function(
 }
 
 
+
+
 main_geocodificacao <- function(
   dt,
   campos,
@@ -270,10 +272,15 @@ main_geocodificacao <- function(
   
   #### 1. Geocodificação e classificação ####
   message("[1/5] Limpando e Geocodificando endereços - frame de ", nrow(dt), " linhas...")
-  dt3 <- geocode_pipeline(dt, campos, campos_pdr)
+  dt3 <- geocode_pipeline(dt, campos, campos_pdr 
+                            #,use_numeric_stopwords = TRUE
+                            #,max_digit_edits = 1L
+                            )
   dt3 <- classificar_precisao_best(dt3, precisao_best_col = "precisao_best", classe_col = classe_col)
   message("[1/5] Concluído!")
-  
+  print(class(dt3))
+  stopifnot(data.table::is.data.table(dt3))
+  print("0")
   #### 2. Subconjunto CEP ####
   dt_cep <- dt3[get(classe_col) == 1L]
   message("[2/5] Extraindo subset de CEPs ", nrow(dt_cep), " registros de CEP selecionados.")
@@ -287,31 +294,29 @@ main_geocodificacao <- function(
   ceps_aceitos <- res$ceps_aceitos
   message("[3/5] Concluído! ", length(ceps_aceitos), " CEPs aceitos",
           " de um total de ", length(unique(dt_cep$cep_padr)), " CEPs avaliados.")
-  
+  print("2")
   #### 4. Filtro final de endereços ####
   message("[4/5] Aplicando filtro final nos endereços...")
   dt3 <- filtrar_enderecos_aceitos(
     dt           = dt3,
     ceps_aceitos = ceps_aceitos,
+    cep_col = "cep_padr",
     classe_col   = classe_col,
     aceito_col   = aceito_col
   )
   message("[4/5] Concluído! Endereços filtrados.")
   
   #### 5. Estatísticas descritivas ####
-  message("[5/5] Calculando estatísticas descritivas...")
-  stats <- descritivas(
-    dt          = dt3,
-    estoque_col = var_col,
-    aceito_col  = aceito_col
-  )
-  message("[5/5] Concluído! Estatísticas calculadas.")
+  # message("[5/5] Calculando estatísticas descritivas...")
+  # stats <- descritivas(
+  #   dt          = dt3,
+  #   estoque_col = var_col,
+  #   aceito_col  = aceito_col
+  # )
+  # message("[5/5] Concluído! Estatísticas calculadas.")
   
   #### 6. Retorno ####
+  return(dt3)
   message("Processo finalizado com sucesso!")
   
-  list(
-    dt_f = dt3,
-    stats = stats
-  )
 }

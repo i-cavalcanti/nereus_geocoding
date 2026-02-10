@@ -353,11 +353,11 @@ calcular_stats_imputacao <- function(
 
 main_multiyear <- function(
   dt_first_stage,
-  id_col         = "identificad_m",
-  endereco_col   = "endereco_limpo",
-  diff_threshold = 0.2,
+  id_col          = "identificad_m",
+  endereco_col    = "endereco_best",
+  diff_threshold  = 0.2,
   geo_threshold_m = 1000,
-  verbose        = TRUE
+  verbose         = TRUE
 ) {
 
   log <- function(...) {
@@ -371,10 +371,10 @@ main_multiyear <- function(
 
   stopifnot(
     data.table::is.data.table(dt_first_stage),
-    id_col       %in% names(dt_first_stage),
-    endereco_col %in% names(dt_first_stage),
+    id_col        %in% names(dt_first_stage),
+    endereco_col  %in% names(dt_first_stage),
     "geometry"        %in% names(dt_first_stage),
-    "tipo_resultado"  %in% names(dt_first_stage),
+    "precisao_best"   %in% names(dt_first_stage),
     "estoque"         %in% names(dt_first_stage),
     is.numeric(diff_threshold),
     length(diff_threshold) == 1L,
@@ -389,11 +389,11 @@ main_multiyear <- function(
     id_col,
     endereco_col,
     "geometry",
-    "tipo_resultado",
+    "precisao_best",
     "estoque",
     "municipio",
     "matrizfilial",
-    "aceito" ,
+    "aceito",
     "year",
     "municipio_7",
     "id"        # usado para carregar ref_validated
@@ -405,7 +405,7 @@ main_multiyear <- function(
   }
 
   cols_before <- names(dt_first_stage)
-  dt <- dt_first_stage[, ..needed_cols]   # mantém só o necessário (sem cópia profunda de geometry)
+  dt <- dt_first_stage[, ..needed_cols]
   log("Etapa 0 (seleção colunas): ", length(cols_before), " -> ", length(names(dt)), " colunas")
   log("Mantidas: ", paste(names(dt), collapse = ", "))
 
@@ -418,7 +418,7 @@ main_multiyear <- function(
   log("Etapa 1: Criando score de precisão (score_precisao)")
   dt <- criar_score_precisao(
     dt,
-    precisao_col = "tipo_resultado",
+    precisao_col = "precisao_best",
     score_col    = "score_precisao"
   )
   log("Score criado. Linhas: ", nrow(dt))
@@ -440,7 +440,7 @@ main_multiyear <- function(
     score_updated_col    = "score_precisao_updated",
     diff_threshold       = diff_threshold,
     geo_threshold_m      = geo_threshold_m,
-    copy_dt              = FALSE,     # evita duplicar base grande (já estamos em dt reduzido)
+    copy_dt              = FALSE,
     verbose              = verbose
   )
 
@@ -453,12 +453,10 @@ main_multiyear <- function(
   log("Etapa 3: Calculando estatísticas de imputação")
 
   tab_aceito_updated <- dt[
-  ,
-  .(N = .N),
-  by = aceito_updated
+    , .(N = .N),
+    by = aceito_updated
   ][
-    ,
-    `:=`(
+    , `:=`(
       prop = N / sum(N),
       perc = 100 * N / sum(N)
     )
@@ -467,20 +465,16 @@ main_multiyear <- function(
   print(tab_aceito_updated)
 
   tab_estoque_aceito_updated <- dt[
-  ,
-  .(estoque_total = sum(estoque, na.rm = TRUE)),
-  by = aceito_updated
+    , .(estoque_total = sum(estoque, na.rm = TRUE)),
+    by = aceito_updated
   ][
-  ,
-  `:=`(
-    prop_estoque = estoque_total / sum(estoque_total),
-    perc_estoque = 100 * estoque_total / sum(estoque_total)
-  )
+    , `:=`(
+      prop_estoque = estoque_total / sum(estoque_total),
+      perc_estoque = 100 * estoque_total / sum(estoque_total)
+    )
   ][order(aceito_updated)]
 
   print(tab_estoque_aceito_updated)
-
-
 
   stats <- calcular_stats_imputacao(
     dt,
@@ -504,6 +498,15 @@ main_multiyear <- function(
   n_ids_after <- data.table::uniqueN(dt[[id_col]])
   log("Filtro concluído. IDs removidos: ", n_ids_before - n_ids_after)
 
+  # --- NOVO: manter apenas geometry_updated (remover geometry)
+  if ("geometry_updated" %in% names(dt)) {
+    dt[, geometry := NULL]
+    # opcional: garantir que geometry_updated é sfc
+    stopifnot(inherits(dt[["geometry_updated"]], "sfc"))
+  } else {
+    stop("Coluna 'geometry_updated' não existe no dt final.")
+  }
+
   log("Processamento finalizado com sucesso")
 
   list(
@@ -511,6 +514,167 @@ main_multiyear <- function(
     stats    = stats
   )
 }
+
+# main_multiyear <- function(
+#   dt_first_stage,
+#   id_col         = "identificad_m",
+#   endereco_col   = "endereco_limpo",
+#   diff_threshold = 0.2,
+#   geo_threshold_m = 1000,
+#   verbose        = TRUE
+# ) {
+
+#   log <- function(...) {
+#     if (isTRUE(verbose)) {
+#       message(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), paste0(...))
+#     }
+#   }
+
+#   log("Iniciando main_multiyear()")
+#   log("id_col: ", id_col, " | endereco_col: ", endereco_col)
+
+#   stopifnot(
+#     data.table::is.data.table(dt_first_stage),
+#     id_col       %in% names(dt_first_stage),
+#     endereco_col %in% names(dt_first_stage),
+#     "geometry"        %in% names(dt_first_stage),
+#     "tipo_resultado"  %in% names(dt_first_stage),
+#     "estoque"         %in% names(dt_first_stage),
+#     is.numeric(diff_threshold),
+#     length(diff_threshold) == 1L,
+#     is.numeric(geo_threshold_m),
+#     length(geo_threshold_m) == 1L
+#   )
+
+#   # ----------------------------
+#   # 0) REDUZIR COLUNAS (antes de tudo)
+#   # ----------------------------
+#   needed_cols <- unique(c(
+#     id_col,
+#     endereco_col,
+#     "geometry",
+#     "tipo_resultado",
+#     "estoque",
+#     "municipio",
+#     "matrizfilial",
+#     "aceito" ,
+#     "year",
+#     "municipio_7",
+#     "id"        # usado para carregar ref_validated
+#   ))
+
+#   missing_needed <- setdiff(needed_cols, names(dt_first_stage))
+#   if (length(missing_needed) > 0L) {
+#     stop("Faltam colunas necessárias no dt_first_stage: ", paste(missing_needed, collapse = ", "))
+#   }
+
+#   cols_before <- names(dt_first_stage)
+#   dt <- dt_first_stage[, ..needed_cols]   # mantém só o necessário (sem cópia profunda de geometry)
+#   log("Etapa 0 (seleção colunas): ", length(cols_before), " -> ", length(names(dt)), " colunas")
+#   log("Mantidas: ", paste(names(dt), collapse = ", "))
+
+#   dropped <- setdiff(cols_before, names(dt))
+#   if (length(dropped) > 0L) log("Removidas: ", paste(dropped, collapse = ", "))
+
+#   # ----------------------------
+#   # 1) Criar score de precisão
+#   # ----------------------------
+#   log("Etapa 1: Criando score de precisão (score_precisao)")
+#   dt <- criar_score_precisao(
+#     dt,
+#     precisao_col = "tipo_resultado",
+#     score_col    = "score_precisao"
+#   )
+#   log("Score criado. Linhas: ", nrow(dt))
+
+#   # ----------------------------
+#   # 2) Imputar endereço e geometria (FAST)
+#   # ----------------------------
+#   log("Etapa 2: Iniciando imputação (string + distância)")
+#   dt <- imputar_endereco_geometry_por_score_fast(
+#     dt,
+#     id_col               = id_col,
+#     endereco_col         = endereco_col,
+#     score_col            = "score_precisao",
+#     municipio_col        = "municipio",
+#     matrizfilial_col     = "matrizfilial",
+#     geometry_col         = "geometry",
+#     validated_col        = "aceito",
+#     geometry_updated_col = "geometry_updated",
+#     score_updated_col    = "score_precisao_updated",
+#     diff_threshold       = diff_threshold,
+#     geo_threshold_m      = geo_threshold_m,
+#     copy_dt              = FALSE,     # evita duplicar base grande (já estamos em dt reduzido)
+#     verbose              = verbose
+#   )
+
+#   n_imputadas <- dt[imputada == 1L, .N]
+#   log("Imputação concluída. Registros imputados: ", n_imputadas)
+
+#   # ----------------------------
+#   # 3) Calcular stats de imputação
+#   # ----------------------------
+#   log("Etapa 3: Calculando estatísticas de imputação")
+
+#   tab_aceito_updated <- dt[
+#   ,
+#   .(N = .N),
+#   by = aceito_updated
+#   ][
+#     ,
+#     `:=`(
+#       prop = N / sum(N),
+#       perc = 100 * N / sum(N)
+#     )
+#   ][order(aceito_updated)]
+
+#   print(tab_aceito_updated)
+
+#   tab_estoque_aceito_updated <- dt[
+#   ,
+#   .(estoque_total = sum(estoque, na.rm = TRUE)),
+#   by = aceito_updated
+#   ][
+#   ,
+#   `:=`(
+#     prop_estoque = estoque_total / sum(estoque_total),
+#     perc_estoque = 100 * estoque_total / sum(estoque_total)
+#   )
+#   ][order(aceito_updated)]
+
+#   print(tab_estoque_aceito_updated)
+
+
+
+#   stats <- calcular_stats_imputacao(
+#     dt,
+#     imputada_col = "imputada",
+#     estoque_col  = "estoque"
+#   )
+#   log("Estatísticas calculadas")
+
+#   # ----------------------------
+#   # 4) Filtrar IDs com estoque zero
+#   # ----------------------------
+#   log("Etapa 4: Filtrando IDs com estoque total igual a zero")
+#   n_ids_before <- data.table::uniqueN(dt[[id_col]])
+
+#   dt <- filtrar_ids_estoque_zero(
+#     dt          = dt,
+#     id_col      = id_col,
+#     estoque_col = "estoque"
+#   )
+
+#   n_ids_after <- data.table::uniqueN(dt[[id_col]])
+#   log("Filtro concluído. IDs removidos: ", n_ids_before - n_ids_after)
+
+#   log("Processamento finalizado com sucesso")
+
+#   list(
+#     dt_final = dt,
+#     stats    = stats
+#   )
+# }
 
 
 

@@ -15,6 +15,40 @@ check_and_install_packages(required_packages)
 lapply(required_packages, library, character.only = TRUE)
 
 
+dt <- fread("D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/csv_por_ano/sp_estb_2016_limpo_corr.csv")
+
+dt <- readRDS("D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/geocoded_rds/dt_f_2016.rds")
+setDT(dt)  
+View(dt)
+dt[, .N, by = best_step][, prop := N / sum(N)][order(-prop)]
+t <- head(dt, 1000)
+
+
+anos <- 2015:2016
+
+base_dir <- "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/geocoded_rds"
+
+res <- rbindlist(lapply(anos, function(ano) {
+  arq <- file.path(base_dir, sprintf("dt_f_%d.rds", ano))
+  dt  <- readRDS(arq)
+  setDT(dt)
+
+  # garante 0/1 e trata NA
+  n_total <- sum(!is.na(dt$aceito))
+  n_aceito <- sum(dt$aceito == 1, na.rm = TRUE)
+  prop <- if (n_total > 0) n_aceito / n_total else NA_real_
+
+  data.table(
+    ano = ano,
+    n_total = n_total,
+    n_aceito = n_aceito,
+    prop_aceito = prop
+  )
+}))
+
+res
+
+
 # ---- parâmetros de teste ----
 pathname_in  <- "D:/Arq-Azzoni/RAIS/rais-geocoding/data"   # ajuste
 year         <- 2015
@@ -41,8 +75,8 @@ if (!("bairro" %in% names(dt)))    dt[, bairro := NA_character_]
 if (!("numlograd" %in% names(dt))) dt[, numlograd := NA]
 
 geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id")
-# filter_cnae = c(7500100, 4789004, 9609208, 4771704)
-# dt <- dt[sbclas20 %in% unlist(filter_cnae)]
+filter_cnae = c(7500100, 4789004, 9609208, 4771704)
+dt <- dt[sbclas20 %in% unlist(filter_cnae)]
 filter_municipio_7 = c("3525904","3543402","3529005","3534708")
 dt <- dt[municipio_7 %in% filter_municipio_7]
 dt <- dt[, ..geocode_keep]
@@ -65,7 +99,10 @@ campos_pdr <- correspondencia_campos(
   estado = "uf_dom"
 )
 
-dt_out <- geocode_pipeline_bestgeom(dt, campos, campos_pdr)
+
+############
+
+dt_out <- geocode_pipeline(dt, campos, campos_pdr)
 
 
 
