@@ -26,10 +26,10 @@ t <- head(dt, 1000)
 
 anos <- 2015:2016
 
-base_dir <- "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/geocoded_rds"
+base_dir <- "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/geocoded_rd_brasil"
 
 res <- rbindlist(lapply(anos, function(ano) {
-  arq <- file.path(base_dir, sprintf("dt_f_%d.rds", ano))
+  arq <- file.path(base_dir, sprintf("dt_f_sp_%d.rds", ano))
   dt  <- readRDS(arq)
   setDT(dt)
 
@@ -51,7 +51,7 @@ res
 
 # ---- parâmetros de teste ----
 pathname_in  <- "D:/Arq-Azzoni/RAIS/rais-geocoding/data"   # ajuste
-year         <- 2015
+year         <- 2019
 encoding     <- "Latin-1"
 filename_prefix <- "sp"
 
@@ -118,16 +118,54 @@ dt_pad <- padronizar_enderecos(dt, campos_do_endereco = campos_pdr)
 
 if ("numero_padr" %in% names(dt_pad)) dt_pad[numero_padr == "S/N", numero_padr := NA]
 
-campos_pad <- geocodebr::definir_campos(
-    logradouro = "logradouro_padr",
-    numero     = "numero_padr",
-    cep        = "cep_padr",
-    localidade = "bairro_padr",
-    municipio  = "municipio_padr",
-    estado     = "estado_padr"
+
+a <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      municipio_col     = "municipio_7",
+      cep_col           = "cep_padr",
+      use_numeric_stopwords = TRUE,
+      max_digit_edits   = 2,
+      endereco_update_mode = "cut_when_missing_num"
+    )
+
+
+campos_lns <- geocodebr::definir_campos(
+      logradouro = "endereco_limpo",
+      numero     = "numlograd_novo",
+      cep        = "cep_padr",
+      localidade = "bairro_padr",
+      municipio  = "municipio_padr",
+      estado     = "estado_padr"
+    )
+
+g <- geocodebr::geocode(
+    enderecos          = a,
+    campos_endereco    = campos_lns,
+    resultado_completo = FALSE,
+    resolver_empates   = TRUE,
+    resultado_sf       = FALSE,
+    verboso            = FALSE
   )
 
+g <- data.table::as.data.table(g)
+
+g <- criar_score_precisao(g, precisao_col = "tipo_resultado", score_col = "score")
+
+g_pad[, aceito := fifelse(score_precisao_pad %in% c(27L, 28L), 1L, 0L)]
+
+tab_aceito <-g_pad[, .(
+  n = .N,
+  aceitos = sum(aceito == 1L, na.rm = TRUE),
+  perc_aceito = 100 * mean(aceito == 1L, na.rm = TRUE)
+)]
+
+tab_aceito
+
 g_pad <- geocode_step(dt_pad, campos_pad, "pad", keep_geometry = FALSE)
+
 
 dt_lns <- logradouro_num_string_fast(
       dt_pad,
