@@ -1,0 +1,1147 @@
+source("scripts/general-functions.R")
+source("scripts/data-standardization.R")
+source("scripts/metrics-functions.R")
+source("logradouro_num_string.R")
+source("geocoding_first_stage.R")
+source("geocoding_second_stage.R")
+source("geocodificar_enderecos.R")
+
+
+
+
+required_packages <- c("enderecobr","geocodebr", "data.table", "sf")
+
+check_and_install_packages(required_packages)
+lapply(required_packages, library, character.only = TRUE)
+
+
+dt <- fread("D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/csv_por_ano/sp_estb_2016_limpo_corr.csv")
+
+dt <- readRDS("D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/geocoded_rds/dt_f_2016.rds")
+setDT(dt)  
+View(dt)
+dt[, .N, by = best_step][, prop := N / sum(N)][order(-prop)]
+t <- head(dt, 1000)
+
+
+anos <- 2015:2016
+
+base_dir <- "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/geocoded_rd_brasil"
+
+res <- rbindlist(lapply(anos, function(ano) {
+  arq <- file.path(base_dir, sprintf("dt_f_sp_%d.rds", ano))
+  dt  <- readRDS(arq)
+  setDT(dt)
+
+  # garante 0/1 e trata NA
+  n_total <- sum(!is.na(dt$aceito))
+  n_aceito <- sum(dt$aceito == 1, na.rm = TRUE)
+  prop <- if (n_total > 0) n_aceito / n_total else NA_real_
+
+  data.table(
+    ano = ano,
+    n_total = n_total,
+    n_aceito = n_aceito,
+    prop_aceito = prop
+  )
+}))
+
+res
+
+
+# ---- parâmetros de teste ----
+pathname_in  <- "D:/Arq-Azzoni/RAIS/rais-geocoding/data"   # ajuste
+year         <- 2019
+encoding     <- "Latin-1"
+filename_prefix <- "sp"
+
+# ---- montar caminho e ler ----
+filename <- paste0(filename_prefix, "_estb_", year, "_limpo")
+file_in  <- file.path(pathname_in, "raw", "rais_temp", paste0(filename, ".csv"))
+
+dt <- fread(file_in, encoding = encoding)
+
+cat("Linhas lidas:", nrow(dt), "\n")
+cat("Colunas:", ncol(dt), "\n")
+print(names(dt))
+
+t<-head(dt, 1000)
+
+dt[, municipio_7 := ibge6_to_7(municipio)]
+dt <- add_sigla_from_uf(dt, "cduf", "uf_dom")
+dt <- change_cep_99999999_to_na(dt, "cep", "municipio")
+
+if (!("bairro" %in% names(dt)))    dt[, bairro := NA_character_]
+if (!("numlograd" %in% names(dt))) dt[, numlograd := NA]
+
+geocode_keep <- c("endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial", "id")
+filter_cnae = c(7500100, 4789004, 9609208, 4771704)
+dt <- dt[sbclas20 %in% unlist(filter_cnae)]
+filter_municipio_7 = c("3525904","3543402","3529005","3534708")
+dt <- dt[municipio_7 %in% filter_municipio_7]
+dt <- dt[, ..geocode_keep]
+
+campos <- geocodebr::definir_campos(
+      logradouro = "endereco",
+      numero     = "numlograd",
+      cep        = "cep",
+      localidade     = "bairro",
+      municipio  = "municipio_7",
+      estado     = "uf_dom"
+    )
+
+campos_pdr <- correspondencia_campos(
+  logradouro = "endereco",
+  numero = "numlograd",
+  cep = "cep",
+  bairro = "bairro",
+  municipio = "municipio_7",
+  estado = "uf_dom"
+)
+
+
+############
+
+dt_out <- geocode_pipeline(dt, campos, campos_pdr)
+
+
+
+dt_out <- classificar_precisao_best(dt_out, precisao_best_col = "precisao_best", classe_col = "classe")
+
+#############################################
+
+
+
+g_raw <- geocode_step(dt, campos, "raw", keep_geometry = FALSE)
+
+dt_pad <- padronizar_enderecos(dt, campos_do_endereco = campos_pdr)
+
+if ("numero_padr" %in% names(dt_pad)) dt_pad[numero_padr == "S/N", numero_padr := NA]
+
+
+a <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      municipio_col     = "municipio_7",
+      cep_col           = "cep_padr",
+      use_numeric_stopwords = TRUE,
+      max_digit_edits   = 2,
+      endereco_update_mode = "cut_when_missing_num"
+    )
+
+
+campos_lns <- geocodebr::definir_campos(
+      logradouro = "endereco_limpo",
+      numero     = "numlograd_novo",
+      cep        = "cep_padr",
+      localidade = "bairro_padr",
+      municipio  = "municipio_padr",
+      estado     = "estado_padr"
+    )
+
+g <- geocodebr::geocode(
+    enderecos          = a,
+    campos_endereco    = campos_lns,
+    resultado_completo = FALSE,
+    resolver_empates   = TRUE,
+    resultado_sf       = FALSE,
+    verboso            = FALSE
+  )
+
+g <- data.table::as.data.table(g)
+
+g <- criar_score_precisao(g, precisao_col = "tipo_resultado", score_col = "score")
+
+g_pad[, aceito := fifelse(score_precisao_pad %in% c(27L, 28L), 1L, 0L)]
+
+tab_aceito <-g_pad[, .(
+  n = .N,
+  aceitos = sum(aceito == 1L, na.rm = TRUE),
+  perc_aceito = 100 * mean(aceito == 1L, na.rm = TRUE)
+)]
+
+tab_aceito
+
+g_pad <- geocode_step(dt_pad, campos_pad, "pad", keep_geometry = FALSE)
+
+
+dt_lns <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      endereco_update_mode = "no_cut"
+    )
+
+campos_lns <- geocodebr::definir_campos(
+      logradouro = "endereco_limpo",
+      numero     = "numlograd_novo",
+      cep        = "cep_padr",
+      localidade = "bairro_padr",
+      municipio  = "municipio_padr",
+      estado     = "estado_padr"
+    )
+
+g_lns_0 <- geocode_step(dt_lns, campos_lns, "lns_0", keep_geometry = FALSE)
+
+dt_lns <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      endereco_update_mode =  "cut_when_missing_num"
+    )
+
+g_lns_1 <- geocode_step(dt_lns, campos_lns, "lns_1", keep_geometry = FALSE)
+
+dt_lns <- logradouro_num_string_fast(
+      dt_pad,
+      endereco_col = "logradouro_padr",
+      num_col = "numero_padr",
+      complemento_col = "complemento",
+      endereco_update_mode =  "always_cut_on_stopword"
+    )
+
+g_lns_2 <- geocode_step(dt_lns, campos_lns, "lns_2", keep_geometry = FALSE)
+
+for (nm in c("g_raw","g_pad","g_lns_0","g_lns_1","g_lns_2")) {
+  setkey(get(nm), id)
+}
+
+dt_out <- Reduce(function(x, y) y[x], list(g_raw, g_pad, g_lns_0, g_lns_1, g_lns_2))
+
+
+score_cols <- grep("^score_precisao", names(dt_out), value = TRUE)
+
+# melhor (menor) e pior (maior) por linha
+dt_out[, best_score  := do.call(pmin, c(.SD, na.rm = TRUE)), .SDcols = score_cols]
+dt_out[, worst_score := do.call(pmax, c(.SD, na.rm = TRUE)), .SDcols = score_cols]
+
+# se todas forem NA, pmin/pmax viram +/-Inf -> volta pra NA
+dt_out[is.infinite(best_score),  best_score  := NA_real_]
+dt_out[is.infinite(worst_score), worst_score := NA_real_]
+
+# diferença
+dt_out[, diff := worst_score - best_score]
+
+
+stopifnot(length(score_cols) > 0)
+
+m <- as.matrix(dt_out[, ..score_cols])
+
+# NA vira +Inf pra não ganhar como mínimo
+m2 <- m
+m2[is.na(m2)] <- Inf
+
+# linhas onde tudo era NA
+all_na <- rowSums(is.na(m)) == ncol(m)
+
+# índice do menor por linha (empate -> última)
+idx <- max.col(-m2, ties.method = "last")
+
+dt_out[, best_score_col := score_cols[idx]]
+dt_out[all_na, best_score_col := NA_character_]
+
+# opcional: salvar só o "step"
+dt_out[, best_step := sub("^score_precisao_", "", best_score_col)]
+
+
+###############
+geocode_step <- function(dt_in, campos, step_tag,
+                         id_key = "id",
+                         keep_geometry = FALSE,
+                         resultado_completo = FALSE,
+                         resolver_empates = TRUE,
+                         verboso = FALSE,
+                         precisao_col = "tipo_resultado") {
+
+  stopifnot(data.table::is.data.table(dt_in))
+  if (!(id_key %in% names(dt_in))) stop("geocode_step: falta '", id_key, "' no input.")
+
+  # ---- garantir que 'id' é uma chave válida
+  stopifnot("id" %in% names(dt))
+  stopifnot(!anyNA(dt$id))
+
+  if (data.table::uniqueN(dt$id) != nrow(dt)) {
+    stop("id não é único (uniqueN(id) != nrow(dt)). Não pode usar id como chave.")
+  }
+
+  dt_local <- dt_in
+
+  # remove colunas começando com "." (evita quebra no SQL)
+  dot_cols <- grep("^\\.", names(dt_local), value = TRUE)
+  if (length(dot_cols) > 0L) dt_local[, (dot_cols) := NULL]
+
+  g <- geocodebr::geocode(
+    enderecos          = dt_local,
+    campos_endereco    = campos,
+    resultado_completo = resultado_completo,
+    resolver_empates   = resolver_empates,
+    resultado_sf       = isTRUE(keep_geometry),
+    verboso            = verboso
+  )
+  g <- data.table::as.data.table(g)
+
+  if (!(id_key %in% names(g))) stop("geocode_step: '", id_key, "' não veio no retorno do geocode.")
+  if (!(precisao_col %in% names(g))) stop("geocode_step: '", precisao_col, "' não veio no retorno do geocode.")
+
+  score_col <- paste0("score_precisao_", step_tag)
+  g <- criar_score_precisao(g, precisao_col = precisao_col, score_col = score_col)
+
+  prec_out <- paste0("precisao_", step_tag)
+  data.table::setnames(g, precisao_col, prec_out)
+
+  out_cols <- c(id_key, prec_out, score_col)
+
+  if (isTRUE(keep_geometry)) {
+    if (!("geometry" %in% names(g))) stop("geocode_step: geometry não veio (resultado_sf=TRUE?).")
+    geom_out <- paste0("geometry_", step_tag)
+    data.table::setnames(g, "geometry", geom_out)
+    out_cols <- c(out_cols, geom_out)
+  }
+
+  g[, ..out_cols]
+}
+
+
+
+##############
+
+dt3 <- geocodificar_enderecos_v4(
+    dt                 = dt,
+    campos_do_endereco = campos
+  )
+
+##############
+
+score_cols <- grep("^score_", names(dt3), value = TRUE)
+
+dt3[, score_min := do.call(pmin.int, c(.SD, na.rm = TRUE)), .SDcols = score_cols]
+dt3[, score_dif := score_precisao - score_min]
+
+
+dt_pad <- padronizar_enderecos(dt, campos_do_endereco = campos)
+
+dt_nc  <- logradouro_num_string_fast(dt_pad, "logradouro_padr","numero_padr","complemento", "no_cut")
+dt_cmn <- logradouro_num_string_fast(dt_pad, "logradouro_padr","numero_padr","complemento", "cut_when_missing_num")
+dt_acs <- logradouro_num_string_fast(dt_pad, "logradouro_padr","numero_padr","complemento", "always_cut_on_stopword")
+
+# how many rows actually change?
+c(
+  diff_nc_cmn = sum(dt_nc$endereco_limpo != dt_cmn$endereco_limpo, na.rm=TRUE),
+  diff_cmn_acs = sum(dt_cmn$endereco_limpo != dt_acs$endereco_limpo, na.rm=TRUE),
+  diff_nc_acs = sum(dt_nc$endereco_limpo != dt_acs$endereco_limpo, na.rm=TRUE)
+)
+
+c(
+  diff_num_nc_cmn  = sum(dt_nc$numlograd_novo != dt_cmn$numlograd_novo, na.rm=TRUE),
+  diff_num_cmn_acs = sum(dt_cmn$numlograd_novo != dt_acs$numlograd_novo, na.rm=TRUE),
+  diff_num_nc_acs  = sum(dt_nc$numlograd_novo != dt_acs$numlograd_novo, na.rm=TRUE)
+)
+
+dt_sub <- dt[1:5000]
+dt_sub[, row_id := .I]
+
+# RAW
+g_raw <- geocodebr::geocode(dt_sub,
+  geocodebr::definir_campos(campos[["logradouro"]],campos[["numero"]],campos[["cep"]],
+                            campos[["bairro"]],campos[["municipio"]],campos[["estado"]]),
+  resultado_sf = FALSE, verboso = FALSE
+)
+
+# PAD
+dt_pad <- padronizar_enderecos(dt_sub, campos_do_endereco = campos)
+g_pad <- geocodebr::geocode(dt_pad,
+  geocodebr::definir_campos("logradouro_padr","numero_padr","cep_padr","bairro_padr","municipio_padr","estado_padr"),
+  resultado_sf = FALSE, verboso = FALSE
+)
+
+table(g_raw$precisao, useNA="ifany")
+table(g_pad$precisao, useNA="ifany")
+
+###############
+
+dt <- padronizar_enderecos(
+    dt,
+    campos_do_endereco = campos
+  )
+  
+
+dt[numero_padr == "S/N", numero_padr := NA]
+
+dt2 <- logradouro_num_string_fast(
+    dt,
+    endereco_col = "logradouro_padr",
+    num_col = "numero_padr",
+    complemento_col = "complemento",
+    endereco_update_mode ="cut_when_missing_num"
+  )
+
+t<-head(dt2, 1000)
+
+
+campos <- geocodebr::definir_campos(
+    logradouro  = "endereco_limpo",
+    numero      = "numlograd_novo",
+    cep         = "cep_padr",
+    localidade  = "bairro_padr",
+    municipio   = "municipio_padr",
+    estado      = "estado_padr"
+  )
+  
+
+dt3 <- geocodebr::geocode(
+enderecos            = dt2,
+campos_endereco      = campos,
+resultado_completo   = FALSE,
+resolver_empates     = TRUE,
+resultado_sf         = TRUE,
+verboso              = FALSE
+)
+
+
+t<-head(dt3, 1000)
+
+setDT(dt3)  # garante que é data.table (mesmo se era data.frame)
+
+tab_precisao <- dt3[, .(N = .N), by = precisao][order(-N)]
+tab_precisao[, prop := N / sum(N)]
+tab_precisao
+
+classe_col <- "classe"
+aceito_col <- "aceito"
+
+dt3[, (classe_col) := data.table::fifelse(
+precisao %in% c("numero", "numero_aproximado", "logradouro"), 0L,
+data.table::fifelse(precisao == "cep", 1L, 2L)
+)]
+
+dt_cep <- dt3[get(classe_col) == 1L]
+
+res <- filtrar_ceps_consistentes(
+dt_ceps         = dt_cep,
+sd_threshold_km = 0.3
+)
+
+ceps_aceitos <- res$ceps_aceitos
+
+
+ 
+dt3 <- filtrar_enderecos_aceitos(
+dt           = dt3,
+ceps_aceitos = ceps_aceitos,
+classe_col   = classe_col,
+aceito_col   = aceito_col
+)
+
+
+tab_aceito <- dt3[, .(N = .N), by = aceito][order(-N)]
+tab_aceito[, prop := N / sum(N)]
+tab_aceito[, perc := round(100 * prop, 2)]
+
+tab_aceito
+
+
+
+#######################################
+montar_rds_paths_da_pasta <- function(
+  rds_dir,
+  pattern = "^dt_f_(\\d{4})\\.rds$"
+) {
+  stopifnot(dir.exists(rds_dir))
+  files <- list.files(rds_dir, pattern = "\\.rds$", full.names = TRUE)
+
+  ok  <- grepl(pattern, basename(files))
+  files <- files[ok]
+  yrs <- sub(pattern, "\\1", basename(files))
+
+  # lista nomeada por ano
+  out <- as.list(files)
+  names(out) <- yrs
+  out
+}
+
+
+main_second_stage_geocoding <- function(
+  pathname_out_prev,
+  out_dir_csv,
+  rds_subdir = "geocoded_rds",
+  rds_pattern = "^dt_f_(\\d{4})\\.rds$",
+  diff_threshold = 0.3,
+  year_col = "year",
+  keep_cols = NULL,
+  # padrão do nome do CSV final por ano
+  filename_prefix = "sp",
+  out_suffix = "_limpo_corr.csv",
+  geo_threshold_m = 1000,
+  overwrite_csv = FALSE,
+  verbose = TRUE
+) {
+  log <- function(...) if (isTRUE(verbose)) message(format(Sys.time(), "[%Y-%m-%d %H:%M:%S] "), paste0(...))
+  dir.create(out_dir_csv, recursive = TRUE, showWarnings = FALSE)
+
+  rds_dir <- file.path(pathname_out_prev, rds_subdir)
+  if (!dir.exists(rds_dir)) stop("Pasta RDS não encontrada: ", rds_dir)
+
+  rds_paths <- montar_rds_paths_da_pasta(rds_dir, pattern = rds_pattern)
+  if (length(rds_paths) == 0L) stop("Nenhum RDS encontrado em ", rds_dir, " com padrão ", rds_pattern)
+
+  years <- sort(as.integer(names(rds_paths)))
+
+  # opcional: limpar outputs antigos
+  if (isTRUE(overwrite_csv)) {
+    for (yy in years) {
+      f <- file.path(out_dir_csv, paste0(filename_prefix, "_estb_", yy, out_suffix))
+      if (file.exists(f)) unlink(f)
+    }
+  }
+
+  log("Lendo e empilhando anos: ", paste(years, collapse = ", "))
+
+  partes <- vector("list", length(rds_paths))
+  k <- 0L
+
+  for (y in names(rds_paths)) {
+    p <- rds_paths[[y]]
+    if (is.null(p) || !nzchar(p) || !file.exists(p)) next
+
+    log("Lendo ano ", y, ": ", p)
+    dt_year <- readRDS(p)
+
+    # reduz colunas para RAM (opcional)
+    if (!is.null(keep_cols)) {
+      keep <- intersect(keep_cols, names(dt_year))
+      dt_year <- dt_year[, ..keep]
+    }
+
+    # garante coluna year
+    if (!(year_col %in% names(dt_year))) {
+      dt_year[, (year_col) := as.integer(y)]
+    } else {
+      dt_year[, (year_col) := as.integer(get(year_col))]
+    }
+
+    k <- k + 1L
+    partes[[k]] <- dt_year
+    rm(dt_year); gc()
+  }
+
+  if (k == 0L) stop("Nenhum RDS válido foi lido.")
+
+  dt_all <- rbindlist(partes[seq_len(k)], use.names = TRUE, fill = TRUE)
+  rm(partes); gc()
+
+  log("dt_all montado. Linhas: ", nrow(dt_all), " | Colunas: ", ncol(dt_all))
+  return(dt_all)
+}
+
+dt_all <- main_second_stage_geocoding(
+  pathname_out_prev = "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding",
+  out_dir_csv       = "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/csv_por_ano",
+  diff_threshold = 0.2,
+  geo_threshold_m = 1000,
+  filename_prefix = "sp",
+  out_suffix = "_limpo_corr.csv",
+  overwrite_csv = TRUE,
+  verbose = TRUE
+)
+names(dt_all)
+
+dt_all[, sort(unique(year))]
+t <- head(dt_all, 1000)
+
+
+id_col         = "identificad_m"
+endereco_col   = "endereco_limpo"
+score_col      = "score_precisao"
+municipio_col        = "municipio"
+matrizfilial_col     = "matrizfilial"
+geometry_col         = "geometry"
+validated_col        = "aceito"
+
+
+needed_cols <- unique(c(
+    id_col,
+    endereco_col,
+    "geometry",
+    "tipo_resultado",
+    "estoque",
+    "municipio",
+    "matrizfilial",
+    "aceito" ,
+    "year",
+    "municipio_7",
+    "id"        # usado para carregar ref_validated
+  ))
+
+dt <- dt_all[, ..needed_cols]   # mantém só o necessário (sem cópia profunda de geometry)
+  
+criar_score_precisao <- function(
+  dt,
+  precisao_col,
+  score_col = "score_precisao"
+) {
+  
+  stopifnot(
+    data.table::is.data.table(dt),
+    is.character(precisao_col),
+    length(precisao_col) == 1L,
+    precisao_col %in% names(dt)
+  )
+  
+  # Ordem definida (mais preciso -> menos preciso)
+  ordem_precisao <- c(
+    "dn01","dn02","dn03","dn04",
+    "pn01","pn02","pn03","pn04",
+    "da01","da02","da03","da04",
+    "pa01","pa02","pa03","pa04",
+    "dl01","dl02","dl03","dl04",
+    "pl01","pl02","pl03","pl04",
+    "dc01","dc02",
+    "db01",
+    "dm01"
+  )
+  
+  mapa_score <- data.table::data.table(
+    precisao = ordem_precisao,
+    score    = seq_along(ordem_precisao)
+  )
+  
+  # join eficiente
+  dt[
+    mapa_score,
+    (score_col) := i.score,
+    on = setNames("precisao", precisao_col)
+  ]
+  
+  # alertar valores não mapeados
+  if (any(is.na(dt[[score_col]]) & !is.na(dt[[precisao_col]]))) {
+    warning("Existem valores de precisão não mapeados para score.")
+  }
+  
+  dt[]
+}
+
+dt <- criar_score_precisao(
+    dt,
+    precisao_col = "tipo_resultado",
+    score_col    = "score_precisao"
+  )
+
+t <- head(dt, 1000)
+dt[, .N, by = year][order(year)]
+names(dt)
+
+na_perc <- function(dt) {
+  stopifnot(is.data.table(dt))
+  data.table(
+    col = names(dt),
+    na_perc = 100 * vapply(dt, function(x) mean(is.na(x)), numeric(1))
+  )[order(-na_perc)]
+}
+
+na_perc(dt)
+
+#################
+
+dt2 <- imputar_endereco_geometry_por_score_fast(
+  dt,
+  id_col = "identificad_m",
+  endereco_col = "endereco_limpo",
+  score_col = "score_precisao",
+  municipio_col = "municipio",
+  matrizfilial_col = "matrizfilial",
+  geometry_col = "geometry",
+  validated_col = "aceito",
+  diff_threshold = 0.3,
+  geo_threshold_m = 2000,
+  verbose = TRUE
+)
+names(dt_all)
+
+dt3 <- filtrar_ids_estoque_zero(
+    dt          = dt2,
+    id_col      = "identificad_m",
+    estoque_col = "estoque"
+  )
+
+
+t <- head(dt2, 1000)
+
+dt2[, .(
+  N = .N,
+  aceito_updated_na = sum(is.na(aceito_updated)),
+  aceito_updated_notna = sum(!is.na(aceito_updated))
+)]
+
+
+tab_aceito_updated <- dt3[
+  ,
+  .(N = .N),
+  by = aceito_updated
+][
+  ,
+  `:=`(
+    prop = N / sum(N),
+    perc = 100 * N / sum(N)
+  )
+][order(aceito_updated)]
+
+tab_aceito_updated
+
+tab_aceito_updated_year <- dt3[
+  ,
+  .(N = .N),
+  by = .(year, aceito_updated)
+][
+  ,
+  `:=`(
+    prop = N / sum(N),
+    perc = 100 * N / sum(N)
+  ),
+  by = year
+][order(year, aceito_updated)]
+
+tab_aceito_updated_year
+
+tab_estoque_aceito_updated <- dt3[
+  ,
+  .(estoque_total = sum(estoque, na.rm = TRUE)),
+  by = aceito_updated
+][
+  ,
+  `:=`(
+    prop_estoque = estoque_total / sum(estoque_total),
+    perc_estoque = 100 * estoque_total / sum(estoque_total)
+  )
+][order(aceito_updated)]
+
+tab_estoque_aceito_updated
+
+#################
+dt <- readRDS("D:\\Arq-Azzoni\\UrbanSprawl\\Bases_dados\\RAIS_estab\\temp_geocoding\\geocoded_rds\\dt_f_2002.rds")
+t<-head(dt, 1000)
+
+#################
+
+ data.table::setorderv(dt, cols = c(id_col, score_col), order = c(1, 1), na.last = TRUE)
+
+ref <- dt[
+    ,
+    .SD[1],
+    by = id_col,
+    .SDcols = c(endereco_col, score_col, geometry_col, validated_col, municipio_col, matrizfilial_col, "year")
+  ]
+
+
+tr <- head(ref, 1000)
+
+data.table::setnames(
+    ref,
+    old = c(endereco_col, score_col, geometry_col, validated_col, municipio_col, matrizfilial_col),
+    new = c("ref_endereco", "ref_score", "ref_geom", "ref_validated", "ref_municipio", "ref_matrizfilial")
+  )
+
+dt[
+    ref,
+    `:=`(
+      ref_endereco     = i.ref_endereco,
+      ref_score        = i.ref_score,
+      ref_geom         = i.ref_geom,
+      ref_validated    = i.ref_validated,
+      ref_municipio    = i.ref_municipio,
+      ref_matrizfilial = i.ref_matrizfilial
+    ),
+    on = id_col
+  ]
+
+cand_idx <- dt[
+    !is.na(ref_municipio) & !is.na(get(municipio_col)) & get(municipio_col) == ref_municipio &
+      !is.na(ref_matrizfilial) & !is.na(get(matrizfilial_col)) & get(matrizfilial_col) == ref_matrizfilial &
+      !is.na(ref_score) & !is.na(get(score_col)) & get(score_col) > ref_score,
+    which = TRUE
+  ]
+
+
+  if (length(cand_idx) == 0L) {
+    dt[, c("ref_endereco","ref_score","ref_geom","ref_validated","ref_municipio","ref_matrizfilial") := NULL]
+    log("Sem candidatos. Fim em ", round(as.numeric(difftime(Sys.time(), t_all, "secs")), 2), "s")
+    return(dt[])
+  }
+
+ref_addr <- dt$ref_endereco[cand_idx]
+x_addr   <- dt[[endereco_col]][cand_idx]
+
+ok_str <- !is.na(ref_addr) & !is.na(x_addr)
+
+diffs <- rep(NA_real_, length(cand_idx))
+if (any(ok_str)) {
+  d <- stringdist::stringdist(ref_addr[ok_str], x_addr[ok_str], method = "lv")
+  denom <- pmax(nchar(ref_addr[ok_str]), nchar(x_addr[ok_str]))
+  diffs[ok_str] <- d / denom
+}
+
+cond_string <- !is.na(diffs) & diffs <= 0.2
+
+need_geo_local <- which(!cond_string)
+dist_m <- rep(NA_real_, length(cand_idx))
+n_geo_calc <- 0L
+if (length(need_geo_local) > 0L) {
+  idx2 <- cand_idx[need_geo_local]
+
+  g_crs <- sf::st_crs(dt[[geometry_col]])
+  is_longlat <- isTRUE(sf::st_is_longlat(g_crs))
+
+  g1 <- dt[[geometry_col]][idx2]
+  g2 <- dt$ref_geom[idx2]
+
+  ok_geom <- !is.na(g1) & !is.na(g2)
+
+  if (any(ok_geom)) {
+    if (!is_longlat) {
+      c1 <- sf::st_coordinates(g1[ok_geom])
+      c2 <- sf::st_coordinates(g2[ok_geom])
+      dist_m_tmp <- sqrt((c1[,1] - c2[,1])^2 + (c1[,2] - c2[,2])^2)
+    } else {
+      sf::sf_use_s2(TRUE)
+      dist_m_tmp <- as.numeric(sf::st_distance(g1[ok_geom], g2[ok_geom], by_element = TRUE))
+    }
+
+    dist_m[need_geo_local[ok_geom]] <- dist_m_tmp
+    n_geo_calc <- sum(ok_geom)
+  }
+}
+
+cond_geo <- !is.na(dist_m) & dist_m <= 1000
+
+imputar <- cond_string | cond_geo
+n_imputar <- sum(imputar, na.rm = TRUE)
+
+endereco_updated_col = "endereco_updated"
+geometry_updated_col = "geometry_updated"
+score_updated_col = "score_precisao_updated"
+validated_updated_col = "aceito_updated"
+
+
+if (n_imputar > 0L) {
+  idx_upd <- cand_idx[imputar]
+
+  dt[idx_upd, imputada := 1L]
+  dt[idx_upd, diff := diffs[imputar]]
+  dt[idx_upd, dist_m := dist_m[imputar]]
+
+  dt[idx_upd, (endereco_updated_col) := ref_endereco]
+  dt[idx_upd, (geometry_updated_col) := ref_geom]
+  dt[idx_upd, (score_updated_col) := ref_score]
+  dt[idx_upd, (validated_updated_col) := ref_validated]
+}
+
+t <- head(dt3, 1000)
+
+
+#################################
+
+csv_dir <- "D:\\Arq-Azzoni\\UrbanSprawl\\Bases_dados\\RAIS_estab\\temp_geocoding\\csv_por_ano"
+pattern <- "^sp_estb_(\\d{4})_limpo_corr.*\\.csv$"   # ajusta se precisar
+
+# Extrai year do nome do arquivo
+get_year <- function(fn) {
+  y <- sub(pattern, "\\1", fn)
+  y <- suppressWarnings(as.integer(y))
+  if (is.na(y)) NA_integer_ else y
+}
+
+files <- list.files(csv_dir, pattern = "\\.csv$", full.names = TRUE)
+files <- files[grepl(pattern, basename(files))]
+
+stopifnot(length(files) > 0)
+
+res <- rbindlist(lapply(files, function(f) {
+  bn <- basename(f)
+  year <- get_year(bn)
+
+  # lê só o identificador (bem mais rápido)
+  dt <- fread(f, select = "identificad_m")
+
+  data.table(
+    file = bn,
+    year = year,
+    n_ids_unicos = uniqueN(dt$identificad_m)
+  )
+}), use.names = TRUE, fill = TRUE)
+
+setorder(res, year, file)
+
+# imprime por arquivo
+print(res)
+
+# média total (média de n_ids_unicos entre arquivos)
+media_total <- res[, mean(n_ids_unicos, na.rm = TRUE)]
+cat("\nMédia total de identificad_m únicos (entre arquivos): ", round(media_total, 2), "\n", sep = "")
+
+
+rds_dir <- "D:\\Arq-Azzoni\\UrbanSprawl\\Bases_dados\\RAIS_estab\\temp_geocoding\\geocoded_rds"
+pattern <- "^dt_f_(\\d{4})\\.rds$"
+
+get_year <- function(fn) {
+  y <- sub(pattern, "\\1", fn)
+  y <- suppressWarnings(as.integer(y))
+  if (is.na(y)) NA_integer_ else y
+}
+
+files <- list.files(rds_dir, pattern = "\\.rds$", full.names = TRUE)
+files <- files[grepl(pattern, basename(files))]
+
+stopifnot(length(files) > 0)
+
+res <- rbindlist(lapply(files, function(f) {
+  bn <- basename(f)
+  year <- get_year(bn)
+
+  dt <- readRDS(f)
+  setDT(dt)
+
+  # pega a coluna (sem copiar muito)
+  if (!("identificad_m" %in% names(dt))) stop("Arquivo sem identificad_m: ", bn)
+
+  data.table(
+    file = bn,
+    year = year,
+    n_ids_unicos = uniqueN(dt$identificad_m)
+  )
+}), use.names = TRUE, fill = TRUE)
+
+setorder(res, year, file)
+
+print(res)
+
+media_total <- res[, mean(n_ids_unicos, na.rm = TRUE)]
+cat("\nMédia total de identificad_m únicos (entre arquivos): ", round(media_total, 2), "\n", sep = "")
+
+
+
+
+
+######################
+
+
+t <- head(dt2, 1000)
+View(t)
+
+tab_perc_aceito <- function(dt, col = "aceito") {
+  stopifnot(is.data.table(dt), col %in% names(dt))
+
+  dt[
+    ,
+    .(N = .N),
+    by = .(valor = get(col))
+  ][
+    ,
+    `:=`(
+      prop = N / sum(N),
+      perc = 100 * N / sum(N)
+    )
+  ][order(valor)]
+}
+
+# uso
+tab_perc_aceito(dt2, "imputada")
+
+
+tab_perc_estoque_por_aceito <- function(dt, col_aceito = "aceito", col_estoque = "estoque") {
+  stopifnot(is.data.table(dt), col_aceito %in% names(dt), col_estoque %in% names(dt))
+
+  dt[
+    ,
+    .(estoque_total = sum(get(col_estoque), na.rm = TRUE)),
+    by = .(aceito = get(col_aceito))
+  ][
+    ,
+    `:=`(
+      prop_estoque = estoque_total / sum(estoque_total),
+      perc_estoque = 100 * estoque_total / sum(estoque_total)
+    )
+  ][order(aceito)]
+}
+
+# uso
+tab_perc_estoque_por_aceito(dt2, "aceito", "estoque")
+
+
+
+pct <- dt3[
+  imputada == 1L,
+  100 * mean(aceito == 0L & aceito_updated == 1L, na.rm = TRUE)
+]
+
+pct
+
+
+dt3[
+  imputada == 1L,
+  .(
+    N_imputadas = .N,
+    N_flip_0_to_1 = sum(aceito == 0L & aceito_updated == 1L, na.rm = TRUE),
+    perc_flip_0_to_1 = 100 * mean(aceito == 0L & aceito_updated == 1L, na.rm = TRUE)
+  )
+]
+
+
+dt3[, .(
+  N_total   = .N,
+  N_na      = sum(is.na(diff)),
+  N_not_na  = sum(!is.na(diff)),
+  perc_na   = 100 * mean(is.na(diff)),
+  perc_not  = 100 * mean(!is.na(diff))
+)]
+
+dt3[, .(imputadas = sum(imputada == 1L), total = .N)]
+
+
+dt3[imputada == 1L, .(
+  N = .N,
+  dist_m_not_na = sum(!is.na(dist_m)),
+  diff_not_na   = sum(!is.na(dist_m))
+)]
+
+dt3[imputada == 1L & is.na(diff),
+    .(geom_na = sum(is.na(geometry)),
+      geom_ref_na = sum(is.na(geometry_updated))),  # ou ref_geom se você ainda tiver no meio do processo
+    ]
+
+
+dt2[imputada == 1L, .(
+  N            = .N,
+  dist_m_not_na= sum(!is.na(dist_m)),
+  diff_not_na  = sum(!is.na(diff)),
+  ambos_not_na = sum(!is.na(dist_m) & !is.na(diff)),
+  ambos_na     = sum(is.na(dist_m) & is.na(diff))
+)]
+
+dt2[imputada==1L, .(
+  por_geo    = 100*mean(!is.na(dist_m)),
+  por_string = 100*mean(!is.na(diff))
+)]
+
+dt2[imputada==1L & !is.na(dist_m), .(
+  n = .N,
+  p50 = quantile(dist_m, 0.50),
+  p90 = quantile(dist_m, 0.90),
+  p99 = quantile(dist_m, 0.99),
+  max = max(dist_m)
+)]
+
+sf::st_crs(dt2$geometry)
+sf::st_is_longlat(dt2$geometry)
+
+dt2[, .(
+  N_total    = .N,
+  N_imputada = sum(imputada == 1L),
+  perc_imputada = 100 * mean(imputada == 1L)
+)]
+
+tab_aceito_updated <- dt3[
+  ,
+  .(N = .N),
+  by = .(aceito_updated)
+][
+  ,
+  `:=`(
+    prop = N / sum(N),
+    perc = 100 * N / sum(N)
+  )
+][order(aceito_updated)]
+
+tab_aceito_updated
+
+tab_aceito_updated_estoque <- dt3[
+  ,
+  .(estoque_total = sum(estoque, na.rm = TRUE)),
+  by = .(aceito_updated)
+][
+  ,
+  `:=`(
+    prop_estoque = estoque_total / sum(estoque_total),
+    perc_estoque = 100 * estoque_total / sum(estoque_total)
+  )
+][order(aceito_updated)]
+
+tab_aceito_updated_estoque
+
+
+dt2[aceito_updated == 1L & aceito != 1L, .(N = .N)]
+dt2[aceito_updated == 1L & aceito != 1L][1:20]
+
+dt2[imputada==1L & is.na(diff), .(N=.N, dist_m_not_na=sum(!is.na(dist_m)), min_dist=min(dist_m, na.rm=TRUE))]
+
+
+dt3[, .(
+  N_total        = .N,
+  N_0_to_1       = sum(aceito == 0L & aceito_updated == 1L, na.rm = TRUE),
+  perc_0_to_1    = 100 * mean(aceito == 0L & aceito_updated == 1L, na.rm = TRUE)
+)]
+
+dt3[imputada == 1L, .(
+  N_imputadas     = .N,
+  N_0_to_1        = sum(aceito == 0L & aceito_updated == 1L, na.rm = TRUE),
+  perc_0_to_1_imp = 100 * mean(aceito == 0L & aceito_updated == 1L, na.rm = TRUE)
+)]
+
+
+
+
+
+x <- dt2[imputada==1L & is.na(diff)][1:200]  # pega uma amostra (até 200)
+d <- st_distance(x$geometry, x$geometry_updated, by_element = TRUE)
+summary(as.numeric(d))
+
+dt2[imputada==1L, sum(!is.na(dist_m))]
+dt2[imputada==1L & is.na(diff), .(N=.N, dist_m_not_na=sum(!is.na(dist_m)))]
+
+
+dt3[, .(
+  N_total        = .N,
+  N_0_to_1       = sum(aceito == 0L & aceito_updated == 1L, na.rm = TRUE),
+  perc_0_to_1    = 100 * mean(aceito == 0L & aceito_updated == 1L, na.rm = TRUE)
+)]
+
+
+t <- head(dt3, 1000)
+
+
+stats_id <- dt[, .(
+  n_linhas    = .N,
+  n_score_na  = sum(is.na(score_precisao)),
+  mean_score  = mean(score_precisao, na.rm = TRUE),
+  var_score   = if (.N - sum(is.na(score_precisao)) >= 2L)
+                  var(score_precisao, na.rm = TRUE)
+                else
+                  NA_real_,
+  sd_score    = if (.N - sum(is.na(score_precisao)) >= 2L)
+                  sd(score_precisao, na.rm = TRUE)
+                else
+                  NA_real_
+), by = identificad_m]
+
+stats_id
+
+stats_id[, .(
+  n_ids = .N,
+  mean_da_media = mean(mean_score, na.rm = TRUE),
+  p50_media = quantile(mean_score, 0.50, na.rm = TRUE),
+  mean_da_var = mean(var_score, na.rm = TRUE),
+  p50_var = quantile(var_score, 0.50, na.rm = TRUE)
+)]
+
+p95 <- stats_id[, quantile(var_score, 0.95, na.rm = TRUE)]
+p99 <- stats_id[, quantile(var_score, 0.99, na.rm = TRUE)]
+
+# % acima do P95 e P99
+stats_id[, .(
+  p95 = p95,
+  perc_acima_p95 = 100 * mean(var_score > p95, na.rm = TRUE),
+  p99 = p99,
+  perc_acima_p99 = 100 * mean(var_score > p99, na.rm = TRUE)
+)]
