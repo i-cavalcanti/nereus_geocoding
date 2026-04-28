@@ -18,7 +18,7 @@ The pipeline uses two core `geocodebr` operations:
 - `geocodebr::definir_campos()`: maps columns in a table to address components such as street, number, CEP, municipality, and state.
 - `geocodebr::geocode()`: geocodes the input addresses and returns precision indicators and, when requested, spatial geometries.
 
-This repository does not replace `geocodebr`. It adds a RAIS-specific workflow around it: address standardization, multiple geocoding attempts, precision scoring, CEP-level quality checks, and multi-year consistency correction.
+This repository adds a RAIS-specific workflow around `geocodebr`: address standardization, multiple geocoding attempts, precision scoring, CEP-level quality checks, and multi-year consistency correction.
 
 ## Repository structure
 
@@ -49,16 +49,16 @@ This repository does not replace `geocodebr`. It adds a RAIS-specific workflow a
 └── .gitignore
 ```
 
-The `R/` folder contains reusable functions only. It should not contain local paths, package installation calls, or concrete region/year execution loops.
+The `R/` folder contains reusable functions only.
 
 The `scripts/` folder contains runnable workflows.
 
-The `config/` folder contains machine-specific paths, file-name templates, regions, CRS choices, thresholds, and filters.
+The `config/` folder contains: file-name templates, regions, CRS choices, thresholds, and filters.
 
 
 ## File-name templates
 
-Input files no longer need to be named exactly as `<region>_estb_<year>_limpo.csv`. File names are controlled by templates in `config/config_example.R`.
+File names are controlled by templates in `config/config_example.R`.
 
 The available placeholders are:
 
@@ -74,15 +74,6 @@ first_stage_rds_template <- "dt_f_{prefix}_{year}.rds"
 first_stage_rds_pattern <- "^dt_f_{prefix}_(\\d{4})\\.rds$"
 final_rds_template <- "{prefix}_estb_{year}_limpo_corr.rds"
 ```
-
-Example: if your raw files are named `rais_sp_2010.csv`, set:
-
-```r
-input_csv_template <- "rais_{prefix}_{year}.csv"
-prev_csv_template <- input_csv_template
-```
-
-If you change `first_stage_rds_template`, also update `first_stage_rds_pattern` so the second stage can find the first-stage RDS files and extract the year.
 
 ## Expected input columns
 
@@ -132,15 +123,8 @@ default_distance_crs <- 5880
 
 These values are used in first-stage CEP dispersion checks through `cep_distance_crs`.
 
-`EPSG:5880` is SIRGAS 2000 / Brazil Polyconic. It uses meter units and covers Brazil, so it is a useful fallback for broad regions or regions spanning multiple UTM zones.
+`EPSG:5880` is SIRGAS 2000 / Brazil Polyconic. It uses meter units and covers Brazil.
 
-Some smaller regions can use regional SIRGAS 2000 / UTM CRS values. For example:
-
-- `EPSG:31982`: SIRGAS 2000 / UTM zone 22S.
-- `EPSG:31983`: SIRGAS 2000 / UTM zone 23S.
-- `EPSG:31984`: SIRGAS 2000 / UTM zone 24S.
-
-The current dictionary is a practical default, not a universal rule. If a region is split across multiple UTM zones, `5880` is safer as a broad projected CRS. If analysis is restricted to a smaller area, a local UTM CRS may be preferable.
 
 ## Pipeline stages
 
@@ -156,11 +140,6 @@ For each region and year, the first stage:
 6. Applies CEP-level consistency checks.
 7. Saves one RDS per region-year using `first_stage_rds_template`.
 
-Default output example:
-
-```text
-dt_f_sp_2010.rds
-```
 
 ### Second stage
 
@@ -173,11 +152,6 @@ For each region, the second stage:
 5. Imputes better address and geometry information to weaker observations when they are consistent by municipality, matriz/filial status, string similarity, or geographic distance.
 6. Saves corrected yearly RDS files using `final_rds_template`.
 
-Default output example:
-
-```text
-sp_estb_2010_limpo_corr.rds
-```
 
 ## CEP consistency rule
 
@@ -197,12 +171,6 @@ Single-point CEPs are accepted by default:
 accept_single_point_cep = TRUE
 ```
 
-This is a pragmatic choice. A single returned point does not provide evidence of internal spatial disagreement, but it also does not allow dispersion to be estimated. For stricter sensitivity checks, set:
-
-```r
-accept_single_point_cep = FALSE
-```
-
 ## Run log
 
 The pipeline writes a lightweight append-only CSV log. The default path is configured in `config/config_example.R`:
@@ -212,61 +180,7 @@ log_dir <- "D:/Arq-Azzoni/UrbanSprawl/Bases_dados/RAIS_estab/temp_geocoding/logs
 log_file <- file.path(log_dir, "run_log.csv")
 ```
 
-The log is designed for reproducibility and troubleshooting, not for final analysis. Each row corresponds to one stage-region-year attempt.
-
 A column-by-column description is available in `docs/run_log_dictionary.md`.
-
-The log records:
-
-```text
-run_id
-stage
-region
-year
-status
-message
-input_file
-output_file
-started_at
-ended_at
-runtime_seconds
-input_rows
-rows_after_filters
-output_rows
-accepted_rows
-rejected_rows
-class0_rows
-class1_rows
-class2_rows
-cep_rows
-cep_accepted
-cep_rejected
-cep_single_point_accepted
-cep_single_point_rejected
-imputed_rows
-geometry_nonmissing
-params
-timestamp_written
-```
-
-Typical `status` values are:
-
-```text
-success
-missing_input_file
-output_exists
-error
-```
-
-The same `run_id` is used across first and second stages when running `scripts/run_all.R`. To set a fixed ID manually, define it in the config:
-
-```r
-run_id <- "baseline_2026_04_28"
-```
-
-If `run_id = NULL`, the scripts create a timestamped ID automatically.
-
-The log file is append-only. If you want a clean log for a new experiment, rename or delete the previous `run_log.csv`, or change `log_file` in the config.
 
 ## Key parameters
 
@@ -290,56 +204,6 @@ The log file is append-only. If you want a clean log for a new experiment, renam
 | `filter_cnae` | Optional CNAE filter. |
 | `overwrite` | Whether to overwrite existing outputs. |
 
-## Reproducing the run
-
-### 1. Restore dependencies
-
-On a new machine:
-
-```r
-install.packages("renv")
-renv::restore()
-```
-
-To initialize the project environment for the first time:
-
-```r
-source("scripts/00_setup_renv.R")
-```
-
-### 2. Edit the config
-
-Edit:
-
-```text
-config/config_example.R
-```
-
-At minimum, check:
-
-- `raw_csv_dir`
-- `first_stage_out`
-- `final_out`
-- `log_file`
-- file-name templates
-- `regions`
-- `years`
-- `region_distance_crs`
-
-### 3. Run the full pipeline
-
-From the project root:
-
-```r
-source("scripts/run_all.R")
-```
-
-Or run each stage separately:
-
-```r
-source("scripts/01_run_first_stage.R")
-source("scripts/02_run_second_stage.R")
-```
 
 ## Outputs
 
