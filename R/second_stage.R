@@ -1,3 +1,19 @@
+# -----------------------------------------------------------------------------
+# Second-stage RAIS establishment geocoding correction
+# -----------------------------------------------------------------------------
+# This file runs the second stage of the RAIS geocoding workflow. For each
+# region, it links first-stage geocoding outputs back to the source RAIS records,
+# stacks establishment-year observations, and uses longitudinal consistency to
+# improve weaker geocoding results. Higher-quality addresses and geometries from
+# the same establishment are propagated only when municipality, establishment
+# type, address-similarity, or geographic-distance checks indicate consistency.
+# The script then saves corrected yearly RDS outputs and writes an append-only
+# run log for auditability.
+
+# -----------------------------------------------------------------------------
+# Longitudinal correction helpers
+# -----------------------------------------------------------------------------
+
 filtrar_ids_estoque_zero <- function(dt, id_col, estoque_col) {
   stopifnot(data.table::is.data.table(dt))
   require_columns(dt, c(id_col, estoque_col), "dt")
@@ -150,6 +166,429 @@ main_multiyear <- function(
   dt[]
 }
 
+# -----------------------------------------------------------------------------
+# Logging, path, and orchestration helpers
+# -----------------------------------------------------------------------------
+
+make_second_stage_params <- function(diff_threshold, geo_threshold_m) {
+  paste0(
+    "diff_threshold=", diff_threshold,
+    ";geo_threshold_m=", geo_threshold_m
+  )
+}
+
+validate_second_stage_paths <- function(pathname_in_rds, pathname_in_prev_csv, out_dir_rds) {
+  if (!dir.exists(pathname_in_rds)) {
+    stop("Input RDS directory does not exist: ", pathname_in_rds, call. = FALSE)
+  }
+  if (!dir.exists(pathname_in_prev_csv)) {
+    stop("Previous CSV directory does not exist: ", pathname_in_prev_csv, call. = FALSE)
+  }
+  ensure_dir(out_dir_rds)
+  invisible(TRUE)
+}
+
+make_second_stage_output_name <- function(year, filename_prefix, final_rds_template, out_suffix = NULL) {
+  if (!is.null(final_rds_template)) {
+    return(build_template(final_rds_template, prefix = filename_prefix, year = year))
+  }
+  paste0(filename_prefix, "_estb_", year, out_suffix)
+}
+
+index_second_stage_inputs <- function(pathname_in_rds, filename_prefix, input_rds_pattern) {
+  input_pattern <- build_template(input_rds_pattern, prefix = filename_prefix)
+  rds_paths <- index_files_by_year(
+    pathname_in_rds,
+    input_pattern,
+    paste0("first-stage RDS for ", filename_prefix)
+  )
+
+  list(
+    rds_paths = rds_paths,
+    years = sort(as.integer(names(rds_paths)))
+  )
+}
+
+remove_existing_second_stage_outputs <- function(
+  out_dir_rds,
+  years,
+  filename_prefix,
+  final_rds_template,
+  out_suffix = NULL
+) {
+  for (yy in years) {
+    out_file <- file.path(
+      out_dir_rds,
+      make_second_stage_output_name(yy, filename_prefix, final_rds_template, out_suffix)
+    )
+    if (file.exists(out_file)) unlink(out_file)
+  }
+  invisible(TRUE)
+}
+
+make_second_stage_year_log <- function(input_rds, prev_csv, output_file, started_at) {
+  list(
+    started_at = started_at,
+    input_file = paste(input_rds, prev_csv, sep = ";"),
+    output_file = output_file,
+    input_rows = NA_integer_,
+    prev_rows = NA_integer_,
+    merged_rows = NA_integer_
+  )
+}
+
+append_second_stage_log <- function(
+  log_file,
+  run_id,
+  filename_prefix,
+  year,
+  status,
+  year_log,
+  params,
+  message = NA_character_,
+  output_rows = NA_integer_,
+  accepted_rows = NA_integer_,
+  rejected_rows = NA_integer_,
+  imputed_rows = NA_integer_,
+  geometry_nonmissing = NA_integer_
+) {
+  append_run_log(log_file, make_log_row(
+    run_id = run_id,
+    stage = "second_stage",
+    region = filename_prefix,
+    year = year,
+    status = status,
+    message = message,
+    input_file = year_log$input_file,
+    output_file = year_log$output_file,
+    started_at = year_log$started_at,
+    ended_at = Sys.time(),
+    input_rows = year_log$input_rows,
+    rows_after_filters = year_log$merged_rows,
+    output_rows = output_rows,
+    accepted_rows = accepted_rows,
+    rejected_rows = rejected_rows,
+    imputed_rows = imputed_rows,
+    geometry_nonmissing = geometry_nonmissing,
+    params = params
+  ))
+}
+
+# -----------------------------------------------------------------------------
+# Data preparation helpers
+# -----------------------------------------------------------------------------
+
+read_previous_csv_for_second_stage <- function(prev_csv, year, encoding, geocode_keep) {
+  cols_available <- names(data.table::fread(
+    prev_csv,
+    nrows = 0,
+    encoding = encoding,
+    showProgress = FALSE
+  ))
+
+  needed_min_raw <- c("municipio", "cduf", "cep", "endereco", "estoque")
+  read_cols <- unique(c(
+    needed_min_raw,
+    "bairro", "numlograd", "identificad_m", "matrizfilial", "id"
+  ))
+
+  dt_prev <- data.table::fread(
+    prev_csv,
+    encoding = encoding,
+    select = intersect(read_cols, cols_available),
+    showProgress = FALSE
+  )
+
+  require_columns(dt_prev, needed_min_raw, paste0("previous CSV ", year))
+  add_col_if_missing(dt_prev, "bairro", NA_character_)
+  add_col_if_missing(dt_prev, "numlograd", NA)
+
+  if (!"municipio_7" %in% names(dt_prev)) {
+    dt_prev[, municipio_7 := ibge6_to_7(municipio)]
+  }
+  if (!"uf_dom" %in% names(dt_prev)) {
+    dt_prev <- add_sigla_from_uf(dt_prev, "cduf", "uf_dom")
+  }
+
+  dt_prev <- change_cep_99999999_to_na(dt_prev, "cep", "municipio")
+  require_columns(dt_prev, "id", paste0("previous CSV ", year))
+
+  keep_prev <- intersect(geocode_keep, names(dt_prev))
+  dt_prev[, ..keep_prev]
+}
+
+merge_second_stage_year <- function(
+  year,
+  input_rds,
+  prev_csv,
+  encoding,
+  geocode_keep,
+  keep_cols = NULL,
+  year_col = "year"
+) {
+  dt_year <- data.table::as.data.table(readRDS(input_rds))
+  require_columns(dt_year, "id", paste0("first-stage RDS ", year))
+
+  dt_prev <- read_previous_csv_for_second_stage(
+    prev_csv = prev_csv,
+    year = year,
+    encoding = encoding,
+    geocode_keep = geocode_keep
+  )
+
+  dt_merged <- merge(dt_year, dt_prev, by = "id", all.x = TRUE, suffixes = c("", ".in"))
+  dt_merged <- fill_from_suffix(dt_merged, suffix = ".in")
+
+  if (!is.null(keep_cols)) {
+    dt_merged <- dt_merged[, intersect(keep_cols, names(dt_merged)), with = FALSE]
+  }
+
+  if (!year_col %in% names(dt_merged)) {
+    dt_merged[, (year_col) := year]
+  } else {
+    dt_merged[, (year_col) := as.integer(get(year_col))]
+    idx_na <- which(is.na(dt_merged[[year_col]]))
+    if (length(idx_na) > 0L) {
+      data.table::set(dt_merged, i = idx_na, j = year_col, value = year)
+    }
+  }
+
+  list(
+    data = dt_merged,
+    input_rows = nrow(dt_year),
+    prev_rows = nrow(dt_prev),
+    merged_rows = nrow(dt_merged)
+  )
+}
+
+read_second_stage_inputs <- function(
+  years,
+  rds_paths,
+  pathname_in_prev_csv,
+  out_dir_rds,
+  filename_prefix,
+  prev_csv_template,
+  final_rds_template,
+  out_suffix,
+  encoding,
+  geocode_keep,
+  keep_cols,
+  year_col,
+  run_id,
+  log_file,
+  params,
+  verbose = TRUE
+) {
+  parts <- vector("list", length(years))
+  year_log <- stats::setNames(vector("list", length(years)), as.character(years))
+
+  for (ii in seq_along(years)) {
+    yy <- years[[ii]]
+    yy_key <- as.character(yy)
+    started_at <- Sys.time()
+    project_log(verbose, "Second stage input: ", filename_prefix, " ", yy)
+
+    input_rds <- rds_paths[[yy_key]]
+    prev_csv <- file.path(
+      pathname_in_prev_csv,
+      build_template(prev_csv_template, prefix = filename_prefix, year = yy)
+    )
+    output_file <- file.path(
+      out_dir_rds,
+      make_second_stage_output_name(yy, filename_prefix, final_rds_template, out_suffix)
+    )
+
+    year_log[[yy_key]] <- make_second_stage_year_log(
+      input_rds = input_rds,
+      prev_csv = prev_csv,
+      output_file = output_file,
+      started_at = started_at
+    )
+
+    if (!file.exists(prev_csv)) {
+      msg <- paste0("Previous CSV not found: ", prev_csv)
+      append_second_stage_log(
+        log_file = log_file,
+        run_id = run_id,
+        filename_prefix = filename_prefix,
+        year = yy,
+        status = "missing_input_file",
+        year_log = year_log[[yy_key]],
+        params = params,
+        message = msg
+      )
+      stop(msg, call. = FALSE)
+    }
+
+    merged <- merge_second_stage_year(
+      year = yy,
+      input_rds = input_rds,
+      prev_csv = prev_csv,
+      encoding = encoding,
+      geocode_keep = geocode_keep,
+      keep_cols = keep_cols,
+      year_col = year_col
+    )
+
+    parts[[ii]] <- merged$data
+    year_log[[yy_key]]$input_rows <- merged$input_rows
+    year_log[[yy_key]]$prev_rows <- merged$prev_rows
+    year_log[[yy_key]]$merged_rows <- merged$merged_rows
+  }
+
+  list(parts = parts, year_log = year_log)
+}
+
+stack_second_stage_inputs <- function(parts, filename_prefix) {
+  non_empty <- Filter(Negate(is.null), parts)
+  if (length(non_empty) == 0L) {
+    stop("No valid first-stage RDS/CSV pairs found for ", filename_prefix, call. = FALSE)
+  }
+
+  data.table::rbindlist(non_empty, use.names = TRUE, fill = TRUE)
+}
+
+run_second_stage_correction <- function(
+  dt_all,
+  years,
+  year_log,
+  run_id,
+  filename_prefix,
+  log_file,
+  params,
+  diff_threshold,
+  geo_threshold_m,
+  verbose = TRUE
+) {
+  tryCatch(
+    main_multiyear(
+      dt_all,
+      diff_threshold = diff_threshold,
+      geo_threshold_m = geo_threshold_m,
+      verbose = verbose
+    ),
+    error = function(e) {
+      for (yy in years) {
+        yy_key <- as.character(yy)
+        append_second_stage_log(
+          log_file = log_file,
+          run_id = run_id,
+          filename_prefix = filename_prefix,
+          year = yy,
+          status = "error",
+          year_log = year_log[[yy_key]],
+          params = params,
+          message = conditionMessage(e)
+        )
+      }
+      stop(e)
+    }
+  )
+}
+
+write_second_stage_outputs <- function(
+  dt_final,
+  years,
+  year_log,
+  out_dir_rds,
+  filename_prefix,
+  final_rds_template,
+  out_suffix,
+  overwrite_rds,
+  year_col,
+  run_id,
+  log_file,
+  params
+) {
+  require_columns(dt_final, year_col, "dt_final")
+
+  years_out <- sort(unique(as.integer(dt_final[[year_col]])))
+  out_paths <- stats::setNames(vector("list", length(years_out)), as.character(years_out))
+
+  for (yy in years_out) {
+    yy_key <- as.character(yy)
+    out_file <- file.path(
+      out_dir_rds,
+      make_second_stage_output_name(yy, filename_prefix, final_rds_template, out_suffix)
+    )
+
+    if (file.exists(out_file) && !isTRUE(overwrite_rds)) {
+      msg <- paste0("Output already exists: ", out_file)
+      append_second_stage_log(
+        log_file = log_file,
+        run_id = run_id,
+        filename_prefix = filename_prefix,
+        year = yy,
+        status = "output_exists",
+        year_log = year_log[[yy_key]],
+        params = params,
+        message = msg
+      )
+      stop(msg, call. = FALSE)
+    }
+
+    dt_out <- dt_final[get(year_col) == yy]
+    require_columns(dt_out, "geometry_updated", paste0("final output ", yy))
+    if (!inherits(dt_out[["geometry_updated"]], "sfc")) {
+      stop("geometry_updated must be sfc for year ", yy, call. = FALSE)
+    }
+
+    saveRDS(dt_out, out_file)
+    out_paths[[yy_key]] <- out_file
+
+    summary <- summarise_second_stage_output(dt_out)
+    append_second_stage_log(
+      log_file = log_file,
+      run_id = run_id,
+      filename_prefix = filename_prefix,
+      year = yy,
+      status = "success",
+      year_log = year_log[[yy_key]],
+      params = params,
+      output_rows = summary$output_rows,
+      accepted_rows = summary$accepted_rows,
+      rejected_rows = summary$rejected_rows,
+      imputed_rows = summary$imputed_rows,
+      geometry_nonmissing = summary$geometry_nonmissing
+    )
+  }
+
+  list(years_out = years_out, out_paths = out_paths)
+}
+
+log_missing_second_stage_outputs <- function(
+  years,
+  years_out,
+  year_log,
+  run_id,
+  filename_prefix,
+  log_file,
+  params
+) {
+  missing_output_years <- setdiff(years, years_out)
+
+  for (yy in missing_output_years) {
+    yy_key <- as.character(yy)
+    append_second_stage_log(
+      log_file = log_file,
+      run_id = run_id,
+      filename_prefix = filename_prefix,
+      year = yy,
+      status = "no_output_rows",
+      year_log = year_log[[yy_key]],
+      params = params,
+      message = "No rows for this year after second-stage processing.",
+      output_rows = 0L
+    )
+  }
+
+  invisible(missing_output_years)
+}
+
+# -----------------------------------------------------------------------------
+# Main second-stage workflow
+# -----------------------------------------------------------------------------
+
 main_second_stage_geocoding <- function(
   pathname_in_rds,
   pathname_in_prev_csv,
@@ -166,238 +605,103 @@ main_second_stage_geocoding <- function(
   overwrite_rds = FALSE,
   verbose = TRUE,
   encoding = "Latin-1",
-  geocode_keep = c("id", "endereco", "numlograd", "cep", "bairro", "municipio_7", "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial"),
+  geocode_keep = c(
+    "id", "endereco", "numlograd", "cep", "bairro", "municipio_7",
+    "uf_dom", "estoque", "identificad_m", "municipio", "matrizfilial"
+  ),
   run_id = NULL,
   log_file = NULL
 ) {
   if (is.null(run_id)) run_id <- make_run_id("second_stage")
 
-  if (!dir.exists(pathname_in_rds)) stop("Input RDS directory does not exist: ", pathname_in_rds, call. = FALSE)
-  if (!dir.exists(pathname_in_prev_csv)) stop("Previous CSV directory does not exist: ", pathname_in_prev_csv, call. = FALSE)
-  ensure_dir(out_dir_rds)
+  validate_second_stage_paths(pathname_in_rds, pathname_in_prev_csv, out_dir_rds)
 
-  input_pattern <- build_template(input_rds_pattern, prefix = filename_prefix)
-  rds_paths <- index_files_by_year(pathname_in_rds, input_pattern, paste0("first-stage RDS for ", filename_prefix))
-  years <- sort(as.integer(names(rds_paths)))
-
-  make_final_rds_name <- function(year) {
-    if (!is.null(final_rds_template)) {
-      return(build_template(final_rds_template, prefix = filename_prefix, year = year))
-    }
-    paste0(filename_prefix, "_estb_", year, out_suffix)
-  }
-
-  params <- paste0(
-    "diff_threshold=", diff_threshold,
-    ";geo_threshold_m=", geo_threshold_m
+  indexed <- index_second_stage_inputs(
+    pathname_in_rds = pathname_in_rds,
+    filename_prefix = filename_prefix,
+    input_rds_pattern = input_rds_pattern
   )
+  years <- indexed$years
+  rds_paths <- indexed$rds_paths
+
+  params <- make_second_stage_params(diff_threshold, geo_threshold_m)
 
   if (isTRUE(overwrite_rds)) {
-    for (yy in years) {
-      path <- file.path(out_dir_rds, make_final_rds_name(yy))
-      if (file.exists(path)) unlink(path)
-    }
-  }
-
-  parts <- vector("list", length(years))
-  n_parts <- 0L
-  year_log <- list()
-
-  for (yy in years) {
-    started_at <- Sys.time()
-    project_log(verbose, "Second stage input: ", filename_prefix, " ", yy)
-
-    input_rds <- rds_paths[[as.character(yy)]]
-    prev_csv <- file.path(pathname_in_prev_csv, build_template(prev_csv_template, prefix = filename_prefix, year = yy))
-    output_file <- file.path(out_dir_rds, make_final_rds_name(yy))
-
-    year_log[[as.character(yy)]] <- list(
-      started_at = started_at,
-      input_file = paste(input_rds, prev_csv, sep = ";"),
-      output_file = output_file,
-      input_rows = NA_integer_,
-      prev_rows = NA_integer_,
-      merged_rows = NA_integer_
+    remove_existing_second_stage_outputs(
+      out_dir_rds = out_dir_rds,
+      years = years,
+      filename_prefix = filename_prefix,
+      final_rds_template = final_rds_template,
+      out_suffix = out_suffix
     )
-
-    if (!file.exists(prev_csv)) {
-      msg <- paste0("Previous CSV not found: ", prev_csv)
-
-      append_run_log(log_file, make_log_row(
-        run_id = run_id,
-        stage = "second_stage",
-        region = filename_prefix,
-        year = yy,
-        status = "missing_input_file",
-        message = msg,
-        input_file = year_log[[as.character(yy)]]$input_file,
-        output_file = output_file,
-        started_at = started_at,
-        ended_at = Sys.time(),
-        params = params
-      ))
-
-      stop(msg, call. = FALSE)
-    }
-
-    dt_year <- data.table::as.data.table(readRDS(input_rds))
-    require_columns(dt_year, "id", paste0("first-stage RDS ", yy))
-    year_log[[as.character(yy)]]$input_rows <- nrow(dt_year)
-
-    cols_available <- names(data.table::fread(prev_csv, nrows = 0, encoding = encoding, showProgress = FALSE))
-    needed_min_raw <- c("municipio", "cduf", "cep", "endereco", "estoque")
-    read_cols <- unique(c(needed_min_raw, "bairro", "numlograd", "identificad_m", "matrizfilial", "id"))
-    dt_prev <- data.table::fread(prev_csv, encoding = encoding, select = intersect(read_cols, cols_available), showProgress = FALSE)
-    year_log[[as.character(yy)]]$prev_rows <- nrow(dt_prev)
-
-    require_columns(dt_prev, needed_min_raw, paste0("previous CSV ", yy))
-    add_col_if_missing(dt_prev, "bairro", NA_character_)
-    add_col_if_missing(dt_prev, "numlograd", NA)
-    if (!"municipio_7" %in% names(dt_prev)) dt_prev[, municipio_7 := ibge6_to_7(municipio)]
-    if (!"uf_dom" %in% names(dt_prev)) dt_prev <- add_sigla_from_uf(dt_prev, "cduf", "uf_dom")
-    dt_prev <- change_cep_99999999_to_na(dt_prev, "cep", "municipio")
-    require_columns(dt_prev, "id", paste0("previous CSV ", yy))
-
-    keep_prev <- intersect(geocode_keep, names(dt_prev))
-    dt_prev <- dt_prev[, ..keep_prev]
-
-    dt_merged <- merge(dt_year, dt_prev, by = "id", all.x = TRUE, suffixes = c("", ".in"))
-    dt_merged <- fill_from_suffix(dt_merged, suffix = ".in")
-    year_log[[as.character(yy)]]$merged_rows <- nrow(dt_merged)
-
-    if (!is.null(keep_cols)) dt_merged <- dt_merged[, intersect(keep_cols, names(dt_merged)), with = FALSE]
-
-    if (!year_col %in% names(dt_merged)) {
-      dt_merged[, (year_col) := yy]
-    } else {
-      dt_merged[, (year_col) := as.integer(get(year_col))]
-      idx_na <- which(is.na(dt_merged[[year_col]]))
-      if (length(idx_na) > 0L) data.table::set(dt_merged, i = idx_na, j = year_col, value = yy)
-    }
-
-    n_parts <- n_parts + 1L
-    parts[[n_parts]] <- dt_merged
   }
 
-  if (n_parts == 0L) stop("No valid first-stage RDS/CSV pairs found for ", filename_prefix, call. = FALSE)
-
-  dt_all <- data.table::rbindlist(parts[seq_len(n_parts)], use.names = TRUE, fill = TRUE)
-
-  dt_final <- tryCatch(
-    main_multiyear(dt_all, diff_threshold = diff_threshold, geo_threshold_m = geo_threshold_m, verbose = verbose),
-    error = function(e) {
-      for (yy in years) {
-        yy_key <- as.character(yy)
-        append_run_log(log_file, make_log_row(
-          run_id = run_id,
-          stage = "second_stage",
-          region = filename_prefix,
-          year = yy,
-          status = "error",
-          message = conditionMessage(e),
-          input_file = year_log[[yy_key]]$input_file,
-          output_file = year_log[[yy_key]]$output_file,
-          started_at = year_log[[yy_key]]$started_at,
-          ended_at = Sys.time(),
-          input_rows = year_log[[yy_key]]$input_rows,
-          rows_after_filters = year_log[[yy_key]]$merged_rows,
-          params = params
-        ))
-      }
-      stop(e)
-    }
+  inputs <- read_second_stage_inputs(
+    years = years,
+    rds_paths = rds_paths,
+    pathname_in_prev_csv = pathname_in_prev_csv,
+    out_dir_rds = out_dir_rds,
+    filename_prefix = filename_prefix,
+    prev_csv_template = prev_csv_template,
+    final_rds_template = final_rds_template,
+    out_suffix = out_suffix,
+    encoding = encoding,
+    geocode_keep = geocode_keep,
+    keep_cols = keep_cols,
+    year_col = year_col,
+    run_id = run_id,
+    log_file = log_file,
+    params = params,
+    verbose = verbose
   )
 
-  require_columns(dt_final, year_col, "dt_final")
+  dt_all <- stack_second_stage_inputs(inputs$parts, filename_prefix)
 
-  years_out <- sort(unique(as.integer(dt_final[[year_col]])))
-  out_paths <- stats::setNames(vector("list", length(years_out)), as.character(years_out))
+  dt_final <- run_second_stage_correction(
+    dt_all = dt_all,
+    years = years,
+    year_log = inputs$year_log,
+    run_id = run_id,
+    filename_prefix = filename_prefix,
+    log_file = log_file,
+    params = params,
+    diff_threshold = diff_threshold,
+    geo_threshold_m = geo_threshold_m,
+    verbose = verbose
+  )
 
-  for (yy in years_out) {
-    yy_key <- as.character(yy)
-    out_file <- file.path(out_dir_rds, make_final_rds_name(yy))
+  output <- write_second_stage_outputs(
+    dt_final = dt_final,
+    years = years,
+    year_log = inputs$year_log,
+    out_dir_rds = out_dir_rds,
+    filename_prefix = filename_prefix,
+    final_rds_template = final_rds_template,
+    out_suffix = out_suffix,
+    overwrite_rds = overwrite_rds,
+    year_col = year_col,
+    run_id = run_id,
+    log_file = log_file,
+    params = params
+  )
 
-    if (file.exists(out_file) && !isTRUE(overwrite_rds)) {
-      msg <- paste0("Output already exists: ", out_file)
-
-      append_run_log(log_file, make_log_row(
-        run_id = run_id,
-        stage = "second_stage",
-        region = filename_prefix,
-        year = yy,
-        status = "output_exists",
-        message = msg,
-        input_file = year_log[[yy_key]]$input_file,
-        output_file = out_file,
-        started_at = year_log[[yy_key]]$started_at,
-        ended_at = Sys.time(),
-        input_rows = year_log[[yy_key]]$input_rows,
-        rows_after_filters = year_log[[yy_key]]$merged_rows,
-        params = params
-      ))
-
-      stop(msg, call. = FALSE)
-    }
-
-    dt_out <- dt_final[get(year_col) == yy]
-    require_columns(dt_out, "geometry_updated", paste0("final output ", yy))
-    if (!inherits(dt_out[["geometry_updated"]], "sfc")) stop("geometry_updated must be sfc for year ", yy, call. = FALSE)
-
-    saveRDS(dt_out, out_file)
-    out_paths[[as.character(yy)]] <- out_file
-
-    summary <- summarise_second_stage_output(dt_out)
-
-    append_run_log(log_file, make_log_row(
-      run_id = run_id,
-      stage = "second_stage",
-      region = filename_prefix,
-      year = yy,
-      status = "success",
-      input_file = year_log[[yy_key]]$input_file,
-      output_file = out_file,
-      started_at = year_log[[yy_key]]$started_at,
-      ended_at = Sys.time(),
-      input_rows = year_log[[yy_key]]$input_rows,
-      rows_after_filters = year_log[[yy_key]]$merged_rows,
-      output_rows = summary$output_rows,
-      accepted_rows = summary$accepted_rows,
-      rejected_rows = summary$rejected_rows,
-      imputed_rows = summary$imputed_rows,
-      geometry_nonmissing = summary$geometry_nonmissing,
-      params = params
-    ))
-  }
-
-
-  missing_output_years <- setdiff(years, years_out)
-  for (yy in missing_output_years) {
-    yy_key <- as.character(yy)
-    append_run_log(log_file, make_log_row(
-      run_id = run_id,
-      stage = "second_stage",
-      region = filename_prefix,
-      year = yy,
-      status = "no_output_rows",
-      message = "No rows for this year after second-stage processing.",
-      input_file = year_log[[yy_key]]$input_file,
-      output_file = year_log[[yy_key]]$output_file,
-      started_at = year_log[[yy_key]]$started_at,
-      ended_at = Sys.time(),
-      input_rows = year_log[[yy_key]]$input_rows,
-      rows_after_filters = year_log[[yy_key]]$merged_rows,
-      output_rows = 0L,
-      params = params
-    ))
-  }
+  log_missing_second_stage_outputs(
+    years = years,
+    years_out = output$years_out,
+    year_log = inputs$year_log,
+    run_id = run_id,
+    filename_prefix = filename_prefix,
+    log_file = log_file,
+    params = params
+  )
 
   invisible(list(
     run_id = run_id,
     region = filename_prefix,
     years_found = years,
-    years_out = years_out,
+    years_out = output$years_out,
     out_dir_rds = out_dir_rds,
-    rds_paths = out_paths,
+    rds_paths = output$out_paths,
     prev_csv_template = prev_csv_template,
     final_rds_template = final_rds_template,
     log_file = log_file

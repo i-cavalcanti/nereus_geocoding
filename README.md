@@ -2,6 +2,8 @@
 
 This repository contains an R pipeline for geocoding Brazilian RAIS establishment records and improving geocoding consistency across years. It is designed for large administrative datasets where establishment addresses may be incomplete, noisy, or recorded inconsistently over time.
 
+RAIS — Relação Anual de Informações Sociais — is a Brazilian employer-employee administrative registry collected annually by the Ministry of Labor. It contains establishment-level and worker-level records reported by formal-sector employers, including information such as firm location, industry, employment, wages, occupation, and worker characteristics.
+
 The project has two main goals:
 
 1. Produce the best available geocoded location for each establishment-year observation.
